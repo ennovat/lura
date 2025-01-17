@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
+
 package proxy
 
 import (
 	"bytes"
 	"io"
-	"io/ioutil"
 	"net/url"
 )
 
@@ -27,11 +27,12 @@ func (r *Request) GeneratePath(URLPattern string) {
 	}
 	buff := []byte(URLPattern)
 	for k, v := range r.Params {
-		key := []byte{}
+		var key []byte
+
 		key = append(key, "{{."...)
 		key = append(key, k...)
 		key = append(key, "}}"...)
-		buff = bytes.Replace(buff, key, []byte(v), -1)
+		buff = bytes.ReplaceAll(buff, key, []byte(v))
 	}
 	r.Path = string(buff)
 }
@@ -42,9 +43,13 @@ func (r *Request) GeneratePath(URLPattern string) {
 // For thread-safe request headers and/or params manipulation, use the proxy.CloneRequest
 // function.
 func (r *Request) Clone() Request {
+	var clonedURL *url.URL
+	if r.URL != nil {
+		clonedURL, _ = url.Parse(r.URL.String())
+	}
 	return Request{
 		Method:  r.Method,
-		URL:     r.URL,
+		URL:     clonedURL,
 		Query:   r.Query,
 		Path:    r.Path,
 		Body:    r.Body,
@@ -66,8 +71,8 @@ func CloneRequest(r *Request) *Request {
 	buf.ReadFrom(r.Body)
 	r.Body.Close()
 
-	r.Body = ioutil.NopCloser(bytes.NewReader(buf.Bytes()))
-	clone.Body = ioutil.NopCloser(buf)
+	r.Body = io.NopCloser(bytes.NewReader(buf.Bytes()))
+	clone.Body = io.NopCloser(buf)
 
 	return &clone
 }

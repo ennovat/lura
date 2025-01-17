@@ -1,23 +1,25 @@
+//go:build !race
 // +build !race
 
 // SPDX-License-Identifier: Apache-2.0
+
 package negroni
 
 import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"testing"
 	"time"
 
-	"github.com/urfave/negroni"
+	"github.com/urfave/negroni/v2"
 
-	"github.com/luraproject/lura/config"
-	"github.com/luraproject/lura/logging"
-	"github.com/luraproject/lura/proxy"
-	"github.com/luraproject/lura/router"
+	"github.com/luraproject/lura/v2/config"
+	"github.com/luraproject/lura/v2/logging"
+	"github.com/luraproject/lura/v2/proxy"
+	"github.com/luraproject/lura/v2/transport/http/server"
 )
 
 func TestDefaultFactory_ok(t *testing.T) {
@@ -88,7 +90,7 @@ func TestDefaultFactory_ok(t *testing.T) {
 	time.Sleep(5 * time.Millisecond)
 
 	for _, endpoint := range serviceCfg.Endpoints {
-		req, _ := http.NewRequest(endpoint.Method, fmt.Sprintf("http://127.0.0.1:8052%s", endpoint.Endpoint), nil)
+		req, _ := http.NewRequest(endpoint.Method, fmt.Sprintf("http://127.0.0.1:8052%s", endpoint.Endpoint), http.NoBody)
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -97,7 +99,7 @@ func TestDefaultFactory_ok(t *testing.T) {
 		}
 		defer resp.Body.Close()
 
-		body, ioerr := ioutil.ReadAll(resp.Body)
+		body, ioerr := io.ReadAll(resp.Body)
 		if ioerr != nil {
 			t.Error("Reading the response:", ioerr.Error())
 			return
@@ -160,7 +162,7 @@ func TestDefaultFactory_middlewares(t *testing.T) {
 	time.Sleep(5 * time.Millisecond)
 
 	for _, endpoint := range serviceCfg.Endpoints {
-		req, _ := http.NewRequest(endpoint.Method, fmt.Sprintf("http://127.0.0.1:8090%s", endpoint.Endpoint), nil)
+		req, _ := http.NewRequest(endpoint.Method, fmt.Sprintf("http://127.0.0.1:8090%s", endpoint.Endpoint), http.NoBody)
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -169,7 +171,7 @@ func TestDefaultFactory_middlewares(t *testing.T) {
 		}
 		defer resp.Body.Close()
 
-		body, ioerr := ioutil.ReadAll(resp.Body)
+		body, ioerr := io.ReadAll(resp.Body)
 		if ioerr != nil {
 			t.Error("Reading the response:", ioerr.Error())
 			return
@@ -178,8 +180,8 @@ func TestDefaultFactory_middlewares(t *testing.T) {
 		if resp.Header.Get("Cache-Control") != "" {
 			t.Error(endpoint.Endpoint, "Cache-Control error:", resp.Header.Get("Cache-Control"))
 		}
-		if resp.Header.Get(router.CompleteResponseHeaderName) != router.HeaderCompleteResponseValue {
-			t.Error(router.CompleteResponseHeaderName, "error:", resp.Header.Get(router.CompleteResponseHeaderName))
+		if resp.Header.Get(server.CompleteResponseHeaderName) != server.HeaderCompleteResponseValue {
+			t.Error(server.CompleteResponseHeaderName, "error:", resp.Header.Get(server.CompleteResponseHeaderName))
 		}
 		if resp.Header.Get("Content-Type") != "application/json" {
 			t.Error(endpoint.Endpoint, "Content-Type error:", resp.Header.Get("Content-Type"))
@@ -252,7 +254,7 @@ func TestDefaultFactory_ko(t *testing.T) {
 		{"GET", "empty"},
 		{"PUT", "also-ignored"},
 	} {
-		req, _ := http.NewRequest(subject[0], fmt.Sprintf("http://127.0.0.1:8053/%s", subject[1]), nil)
+		req, _ := http.NewRequest(subject[0], fmt.Sprintf("http://127.0.0.1:8053/%s", subject[1]), http.NoBody)
 		req.Header.Set("Content-Type", "application/json")
 		checkResponseIs404(t, req)
 	}
@@ -294,7 +296,7 @@ func TestDefaultFactory_proxyFactoryCrash(t *testing.T) {
 	time.Sleep(5 * time.Millisecond)
 
 	for _, subject := range [][]string{{"GET", "ignored"}, {"PUT", "also-ignored"}} {
-		req, _ := http.NewRequest(subject[0], fmt.Sprintf("http://127.0.0.1:8054/%s", subject[1]), nil)
+		req, _ := http.NewRequest(subject[0], fmt.Sprintf("http://127.0.0.1:8054/%s", subject[1]), http.NoBody)
 		req.Header.Set("Content-Type", "application/json")
 		checkResponseIs404(t, req)
 	}
@@ -317,7 +319,7 @@ func checkResponseIs404(t *testing.T, req *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
-	body, ioerr := ioutil.ReadAll(resp.Body)
+	body, ioerr := io.ReadAll(resp.Body)
 	if ioerr != nil {
 		t.Error("Reading the response:", ioerr.Error())
 		return
@@ -326,8 +328,8 @@ func checkResponseIs404(t *testing.T, req *http.Request) {
 	if resp.Header.Get("Cache-Control") != "" {
 		t.Error("Cache-Control error:", resp.Header.Get("Cache-Control"))
 	}
-	if resp.Header.Get(router.CompleteResponseHeaderName) != router.HeaderIncompleteResponseValue {
-		t.Error(req.URL.String(), router.CompleteResponseHeaderName, "error:", resp.Header.Get(router.CompleteResponseHeaderName))
+	if resp.Header.Get(server.CompleteResponseHeaderName) != server.HeaderIncompleteResponseValue {
+		t.Error(req.URL.String(), server.CompleteResponseHeaderName, "error:", resp.Header.Get(server.CompleteResponseHeaderName))
 	}
 	if resp.Header.Get("Content-Type") != "text/plain; charset=utf-8" {
 		t.Error("Content-Type error:", resp.Header.Get("Content-Type"))
@@ -364,6 +366,6 @@ func (e erroredProxyFactory) New(_ *config.EndpointConfig) (proxy.Proxy, error) 
 
 type identityMiddleware struct{}
 
-func (i identityMiddleware) Handler(h http.Handler) http.Handler {
+func (identityMiddleware) Handler(h http.Handler) http.Handler {
 	return h
 }

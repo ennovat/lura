@@ -1,19 +1,21 @@
+//go:build integration || !race
 // +build integration !race
 
 // SPDX-License-Identifier: Apache-2.0
+
 package plugin
 
 import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
-	"github.com/luraproject/lura/config"
-	"github.com/luraproject/lura/logging"
+	"github.com/luraproject/lura/v2/config"
+	"github.com/luraproject/lura/v2/logging"
 )
 
 func TestLoadWithLogger(t *testing.T) {
@@ -52,7 +54,7 @@ func TestLoadWithLogger(t *testing.T) {
 		return
 	}
 
-	req, _ := http.NewRequest("GET", "http://some.example.tld/path", nil)
+	req, _ := http.NewRequest("GET", "http://some.example.tld/path", http.NoBody)
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 
@@ -63,7 +65,7 @@ func TestLoadWithLogger(t *testing.T) {
 		return
 	}
 
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Error(err)
 		return

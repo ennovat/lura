@@ -1,7 +1,8 @@
-/* Package server provides tools to create http servers and handlers wrapping the
-   lura router
-*/
 // SPDX-License-Identifier: Apache-2.0
+
+/*
+Package server provides tools to create http servers and handlers wrapping the lura router
+*/
 package server
 
 import (
@@ -10,14 +11,17 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
-	"github.com/luraproject/lura/config"
-	"github.com/luraproject/lura/core"
+	"github.com/luraproject/lura/v2/config"
+	"github.com/luraproject/lura/v2/core"
+	"github.com/luraproject/lura/v2/logging"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 )
 
 // ToHTTPError translates an error into a HTTP status code
@@ -52,76 +56,133 @@ var (
 	ErrPrivateKey = errors.New("private key not defined")
 	// ErrPublicKey is the error returned by the router when the public key is not defined
 	ErrPublicKey = errors.New("public key not defined")
+	loggerPrefix = "[SERVICE: HTTP Server]"
 )
 
 // InitHTTPDefaultTransport ensures the default HTTP transport is configured just once per execution
 func InitHTTPDefaultTransport(cfg config.ServiceConfig) {
-	onceTransportConfig.Do(func() {
-		http.DefaultTransport = &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			DialContext: (&net.Dialer{
-				Timeout:       cfg.DialerTimeout,
-				KeepAlive:     cfg.DialerKeepAlive,
-				FallbackDelay: cfg.DialerFallbackDelay,
-				DualStack:     true,
-			}).DialContext,
-			DisableCompression:    cfg.DisableCompression,
-			DisableKeepAlives:     cfg.DisableKeepAlives,
-			MaxIdleConns:          cfg.MaxIdleConns,
-			MaxIdleConnsPerHost:   cfg.MaxIdleConnsPerHost,
-			IdleConnTimeout:       cfg.IdleConnTimeout,
-			ResponseHeaderTimeout: cfg.ResponseHeaderTimeout,
-			ExpectContinueTimeout: cfg.ExpectContinueTimeout,
-			TLSHandshakeTimeout:   10 * time.Second,
+	InitHTTPDefaultTransportWithLogger(cfg, nil)
+}
+
+func InitHTTPDefaultTransportWithLogger(cfg config.ServiceConfig, logger logging.Logger) {
+	if logger == nil {
+		logger = logging.NoOp
+	}
+	if cfg.AllowInsecureConnections {
+		if cfg.ClientTLS == nil {
+			cfg.ClientTLS = &config.ClientTLS{}
 		}
+		cfg.ClientTLS.AllowInsecureConnections = true
+	}
+	onceTransportConfig.Do(func() {
+		http.DefaultTransport = NewTransport(cfg, logger)
 	})
+}
+
+func NewTransport(cfg config.ServiceConfig, logger logging.Logger) *http.Transport {
+	return &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:       cfg.DialerTimeout,
+			KeepAlive:     cfg.DialerKeepAlive,
+			FallbackDelay: cfg.DialerFallbackDelay,
+			DualStack:     true,
+		}).DialContext,
+		DisableCompression:    cfg.DisableCompression,
+		DisableKeepAlives:     cfg.DisableKeepAlives,
+		MaxIdleConns:          cfg.MaxIdleConns,
+		MaxIdleConnsPerHost:   cfg.MaxIdleConnsPerHost,
+		IdleConnTimeout:       cfg.IdleConnTimeout,
+		ResponseHeaderTimeout: cfg.ResponseHeaderTimeout,
+		ExpectContinueTimeout: cfg.ExpectContinueTimeout,
+		TLSHandshakeTimeout:   10 * time.Second,
+		TLSClientConfig:       ParseClientTLSConfigWithLogger(cfg.ClientTLS, logger),
+	}
 }
 
 // RunServer runs a http.Server with the given handler and configuration.
 // It configures the TLS layer if required by the received configuration.
 func RunServer(ctx context.Context, cfg config.ServiceConfig, handler http.Handler) error {
-	done := make(chan error)
-	s := NewServer(cfg, handler)
+	return RunServerWithLoggerFactory(nil)(ctx, cfg, handler)
+}
 
-	if s.TLSConfig == nil {
-		go func() {
-			done <- s.ListenAndServe()
-		}()
-	} else {
-		if cfg.TLS.PublicKey == "" {
-			return ErrPublicKey
-		}
-		if cfg.TLS.PrivateKey == "" {
-			return ErrPrivateKey
-		}
-		go func() {
-			done <- s.ListenAndServeTLS(cfg.TLS.PublicKey, cfg.TLS.PrivateKey)
-		}()
-	}
+func RunServerWithLoggerFactory(l logging.Logger) func(context.Context, config.ServiceConfig, http.Handler) error {
+	return func(ctx context.Context, cfg config.ServiceConfig, handler http.Handler) error {
+		done := make(chan error)
+		s := NewServerWithLogger(cfg, handler, l)
 
-	select {
-	case err := <-done:
-		return err
-	case <-ctx.Done():
-		return s.Shutdown(context.Background())
+		if s.TLSConfig == nil {
+			go func() {
+				done <- s.ListenAndServe()
+			}()
+		} else {
+			if len(cfg.TLS.PublicKey) > 0 || len(cfg.TLS.PrivateKey) > 0 {
+				cfg.TLS.Keys = append(cfg.TLS.Keys, config.TLSKeyPair{
+					PublicKey:  cfg.TLS.PublicKey,
+					PrivateKey: cfg.TLS.PrivateKey,
+				})
+			}
+			if len(cfg.TLS.Keys) == 0 {
+				return ErrPublicKey
+			}
+			for _, k := range cfg.TLS.Keys {
+				if k.PublicKey == "" {
+					return ErrPublicKey
+				}
+				if k.PrivateKey == "" {
+					return ErrPrivateKey
+				}
+				cert, err := tls.LoadX509KeyPair(k.PublicKey, k.PrivateKey)
+				if err != nil {
+					return err
+				}
+				s.TLSConfig.Certificates = append(s.TLSConfig.Certificates, cert)
+			}
+
+			go func() {
+				// since we already use the list of certificates in the config
+				// we do not need to specify the files for public and private key here
+				done <- s.ListenAndServeTLS("", "")
+			}()
+		}
+
+		select {
+		case err := <-done:
+			return err
+		case <-ctx.Done():
+			return s.Shutdown(context.Background())
+		}
 	}
 }
 
 // NewServer returns a http.Server ready to serve the injected handler
 func NewServer(cfg config.ServiceConfig, handler http.Handler) *http.Server {
+	return NewServerWithLogger(cfg, handler, nil)
+}
+
+func NewServerWithLogger(cfg config.ServiceConfig, handler http.Handler, logger logging.Logger) *http.Server {
+	if cfg.UseH2C {
+		handler = h2c.NewHandler(handler, &http2.Server{})
+	}
+
 	return &http.Server{
-		Addr:              fmt.Sprintf(":%d", cfg.Port),
+		Addr:              net.JoinHostPort(cfg.Address, fmt.Sprintf("%d", cfg.Port)),
 		Handler:           handler,
 		ReadTimeout:       cfg.ReadTimeout,
 		WriteTimeout:      cfg.WriteTimeout,
 		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
 		IdleTimeout:       cfg.IdleTimeout,
-		TLSConfig:         ParseTLSConfig(cfg.TLS),
+		TLSConfig:         ParseTLSConfigWithLogger(cfg.TLS, logger),
+		MaxHeaderBytes:    cfg.MaxHeaderBytes,
 	}
 }
 
 // ParseTLSConfig creates a tls.Config from the TLS section of the service configuration
 func ParseTLSConfig(cfg *config.TLS) *tls.Config {
+	return ParseTLSConfigWithLogger(cfg, nil)
+}
+
+func ParseTLSConfigWithLogger(cfg *config.TLS, logger logging.Logger) *tls.Config {
 	if cfg == nil {
 		return nil
 	}
@@ -129,24 +190,25 @@ func ParseTLSConfig(cfg *config.TLS) *tls.Config {
 		return nil
 	}
 
+	if logger == nil {
+		logger = logging.NoOp
+	}
+
 	tlsConfig := &tls.Config{
-		MinVersion:               parseTLSVersion(cfg.MinVersion),
-		MaxVersion:               parseTLSVersion(cfg.MaxVersion),
-		CurvePreferences:         parseCurveIDs(cfg),
-		PreferServerCipherSuites: cfg.PreferServerCipherSuites,
-		CipherSuites:             parseCipherSuites(cfg),
+		MinVersion:       parseTLSVersion(cfg.MinVersion),
+		MaxVersion:       parseTLSVersion(cfg.MaxVersion),
+		CurvePreferences: parseCurveIDs(cfg.CurvePreferences),
+		CipherSuites:     parseCipherSuites(cfg.CipherSuites),
 	}
 	if !cfg.EnableMTLS {
 		return tlsConfig
 	}
 
-	certPool, err := x509.SystemCertPool()
-	if err != nil {
-		certPool = x509.NewCertPool()
-	}
+	certPool := loadCertPool(cfg.DisableSystemCaPool, cfg.CaCerts, logger)
 
-	caCert, err := ioutil.ReadFile(cfg.PublicKey)
+	caCert, err := os.ReadFile(cfg.PublicKey)
 	if err != nil {
+		logger.Error(fmt.Sprintf("%s Cannot load public key %s: %s", loggerPrefix, cfg.PublicKey, err.Error()))
 		return tlsConfig
 	}
 	certPool.AppendCertsFromPEM(caCert)
@@ -157,6 +219,56 @@ func ParseTLSConfig(cfg *config.TLS) *tls.Config {
 	return tlsConfig
 }
 
+func ParseClientTLSConfigWithLogger(cfg *config.ClientTLS, logger logging.Logger) *tls.Config {
+	if cfg == nil {
+		return nil
+	}
+	return &tls.Config{
+		InsecureSkipVerify: cfg.AllowInsecureConnections,
+		RootCAs:            loadCertPool(cfg.DisableSystemCaPool, cfg.CaCerts, logger),
+		MinVersion:         parseTLSVersion(cfg.MinVersion),
+		MaxVersion:         parseTLSVersion(cfg.MaxVersion),
+		CurvePreferences:   parseCurveIDs(cfg.CurvePreferences),
+		CipherSuites:       parseCipherSuites(cfg.CipherSuites),
+		Certificates:       loadClientCerts(cfg.ClientCerts, logger),
+	}
+}
+
+func loadCertPool(disableSystemCaPool bool, caCerts []string, logger logging.Logger) *x509.CertPool {
+	certPool := x509.NewCertPool()
+	if !disableSystemCaPool {
+		if systemCertPool, err := x509.SystemCertPool(); err == nil {
+			certPool = systemCertPool
+		} else {
+			logger.Error(fmt.Sprintf("%s Cannot load system CA pool: %s", loggerPrefix, err.Error()))
+		}
+	}
+
+	for _, path := range caCerts {
+		if ca, err := os.ReadFile(path); err == nil {
+			certPool.AppendCertsFromPEM(ca)
+		} else {
+			logger.Error(fmt.Sprintf("%s Cannot load certificate CA %s: %s", loggerPrefix, path, err.Error()))
+		}
+	}
+	return certPool
+}
+
+func loadClientCerts(certFiles []config.ClientTLSCert, logger logging.Logger) []tls.Certificate {
+	certs := make([]tls.Certificate, 0, len(certFiles))
+	for _, certAndKey := range certFiles {
+		cert, err := tls.LoadX509KeyPair(certAndKey.Certificate, certAndKey.PrivateKey)
+		if err != nil {
+			logger.Error(fmt.Sprintf("%s Cannot load client certificate %s, %s: %s",
+				loggerPrefix, certAndKey.Certificate, certAndKey.PrivateKey, err.Error()))
+			continue
+		}
+		certs = append(certs, cert)
+	}
+
+	return certs
+}
+
 func parseTLSVersion(key string) uint16 {
 	if v, ok := versions[key]; ok {
 		return v
@@ -164,28 +276,28 @@ func parseTLSVersion(key string) uint16 {
 	return tls.VersionTLS13
 }
 
-func parseCurveIDs(cfg *config.TLS) []tls.CurveID {
-	l := len(cfg.CurvePreferences)
+func parseCurveIDs(curvePreferences []uint16) []tls.CurveID {
+	l := len(curvePreferences)
 	if l == 0 {
 		return defaultCurves
 	}
 
-	curves := make([]tls.CurveID, len(cfg.CurvePreferences))
+	curves := make([]tls.CurveID, len(curvePreferences))
 	for i := range curves {
-		curves[i] = tls.CurveID(cfg.CurvePreferences[i])
+		curves[i] = tls.CurveID(curvePreferences[i])
 	}
 	return curves
 }
 
-func parseCipherSuites(cfg *config.TLS) []uint16 {
-	l := len(cfg.CipherSuites)
+func parseCipherSuites(cipherSuites []uint16) []uint16 {
+	l := len(cipherSuites)
 	if l == 0 {
 		return defaultCipherSuites
 	}
 
 	cs := make([]uint16, l)
 	for i := range cs {
-		cs[i] = uint16(cfg.CipherSuites[i])
+		cs[i] = uint16(cipherSuites[i])
 	}
 	return cs
 }

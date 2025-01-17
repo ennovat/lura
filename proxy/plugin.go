@@ -1,51 +1,56 @@
 // SPDX-License-Identifier: Apache-2.0
+
 package proxy
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/url"
 
-	"github.com/luraproject/lura/config"
-	"github.com/luraproject/lura/proxy/plugin"
+	"github.com/luraproject/lura/v2/config"
+	"github.com/luraproject/lura/v2/logging"
+	"github.com/luraproject/lura/v2/proxy/plugin"
 )
 
 // NewPluginMiddleware returns an endpoint middleware wrapped (if required) with the plugin middleware.
 // The plugin middleware will try to load all the required plugins from the register and execute them in order.
 // RequestModifiers are executed before passing the request to the next middlware. ResponseModifiers are executed
 // once the response is returned from the next middleware.
-func NewPluginMiddleware(endpoint *config.EndpointConfig) Middleware {
+func NewPluginMiddleware(logger logging.Logger, endpoint *config.EndpointConfig) Middleware {
 	cfg, ok := endpoint.ExtraConfig[plugin.Namespace].(map[string]interface{})
 
 	if !ok {
-		return EmptyMiddleware
+		return emptyMiddlewareFallback(logger)
 	}
 
-	return newPluginMiddleware(cfg)
+	return newPluginMiddleware(logger, "ENDPOINT", endpoint.Endpoint, cfg)
 }
 
 // NewBackendPluginMiddleware returns a backend middleware wrapped (if required) with the plugin middleware.
 // The plugin middleware will try to load all the required plugins from the register and execute them in order.
 // RequestModifiers are executed before passing the request to the next middlware. ResponseModifiers are executed
 // once the response is returned from the next middleware.
-func NewBackendPluginMiddleware(remote *config.Backend) Middleware {
+func NewBackendPluginMiddleware(logger logging.Logger, remote *config.Backend) Middleware {
 	cfg, ok := remote.ExtraConfig[plugin.Namespace].(map[string]interface{})
 
 	if !ok {
-		return EmptyMiddleware
+		return emptyMiddlewareFallback(logger)
 	}
 
-	return newPluginMiddleware(cfg)
+	return newPluginMiddleware(logger, "BACKEND",
+		fmt.Sprintf("%s %s -> %s", remote.ParentEndpointMethod, remote.ParentEndpoint, remote.URLPattern), cfg)
 }
 
-func newPluginMiddleware(cfg map[string]interface{}) Middleware {
+func newPluginMiddleware(logger logging.Logger, tag, pattern string, cfg map[string]interface{}) Middleware {
 	plugins, ok := cfg["name"].([]interface{})
 	if !ok {
-		return EmptyMiddleware
+		return emptyMiddlewareFallback(logger)
 	}
 
-	reqModifiers := []func(interface{}) (interface{}, error){}
-	respModifiers := []func(interface{}) (interface{}, error){}
+	var reqModifiers []func(interface{}) (interface{}, error)
+
+	var respModifiers []func(interface{}) (interface{}, error)
 
 	for _, p := range plugins {
 		name, ok := p.(string)
@@ -54,23 +59,39 @@ func newPluginMiddleware(cfg map[string]interface{}) Middleware {
 		}
 
 		if mf, ok := plugin.GetRequestModifier(name); ok {
-			reqModifiers = append(reqModifiers, mf(cfg))
+			if fn := mf(cfg); fn != nil {
+				reqModifiers = append(reqModifiers, fn)
+			}
 			continue
 		}
 
 		if mf, ok := plugin.GetResponseModifier(name); ok {
-			respModifiers = append(respModifiers, mf(cfg))
+			if fn := mf(cfg); fn != nil {
+				respModifiers = append(respModifiers, fn)
+			}
 		}
 	}
 
 	totReqModifiers, totRespModifiers := len(reqModifiers), len(respModifiers)
 	if totReqModifiers == totRespModifiers && totRespModifiers == 0 {
-		return EmptyMiddleware
+		return emptyMiddlewareFallback(logger)
 	}
+
+	logger.Debug(
+		fmt.Sprintf(
+			"[%s: %s][Modifier Plugins] Adding %d request and %d response modifiers",
+			tag,
+			pattern,
+			totReqModifiers,
+			totRespModifiers,
+		),
+	)
 
 	return func(next ...Proxy) Proxy {
 		if len(next) > 1 {
-			panic(ErrTooManyProxies)
+			logger.Fatal("too many proxies for this proxy middleware: newPluginMiddleware only accepts 1 proxy, got %d tag: %s, pattern: %s",
+				len(next), tag, pattern)
+			return nil
 		}
 
 		if totReqModifiers == 0 {
@@ -80,14 +101,14 @@ func newPluginMiddleware(cfg map[string]interface{}) Middleware {
 					return resp, err
 				}
 
-				return executeResponseModifiers(respModifiers, resp)
+				return executeResponseModifiers(ctx, respModifiers, resp, newRequestWrapper(ctx, r))
 			}
 		}
 
 		if totRespModifiers == 0 {
 			return func(ctx context.Context, r *Request) (*Response, error) {
 				var err error
-				r, err = executeRequestModifiers(reqModifiers, r)
+				r, err = executeRequestModifiers(ctx, reqModifiers, r)
 				if err != nil {
 					return nil, err
 				}
@@ -98,7 +119,7 @@ func newPluginMiddleware(cfg map[string]interface{}) Middleware {
 
 		return func(ctx context.Context, r *Request) (*Response, error) {
 			var err error
-			r, err = executeRequestModifiers(reqModifiers, r)
+			r, err = executeRequestModifiers(ctx, reqModifiers, r)
 			if err != nil {
 				return nil, err
 			}
@@ -108,22 +129,14 @@ func newPluginMiddleware(cfg map[string]interface{}) Middleware {
 				return resp, err
 			}
 
-			return executeResponseModifiers(respModifiers, resp)
+			return executeResponseModifiers(ctx, respModifiers, resp, newRequestWrapper(ctx, r))
 		}
 	}
 }
 
-func executeRequestModifiers(reqModifiers []func(interface{}) (interface{}, error), r *Request) (*Request, error) {
+func executeRequestModifiers(ctx context.Context, reqModifiers []func(interface{}) (interface{}, error), r *Request) (*Request, error) {
 	var tmp RequestWrapper
-	tmp = requestWrapper{
-		method:  r.Method,
-		url:     r.URL,
-		query:   r.Query,
-		path:    r.Path,
-		body:    r.Body,
-		params:  r.Params,
-		headers: r.Headers,
-	}
+	tmp = newRequestWrapper(ctx, r)
 
 	for _, f := range reqModifiers {
 		res, err := f(tmp)
@@ -148,9 +161,11 @@ func executeRequestModifiers(reqModifiers []func(interface{}) (interface{}, erro
 	return r, nil
 }
 
-func executeResponseModifiers(respModifiers []func(interface{}) (interface{}, error), r *Response) (*Response, error) {
+func executeResponseModifiers(ctx context.Context, respModifiers []func(interface{}) (interface{}, error), r *Response, req RequestWrapper) (*Response, error) {
 	var tmp ResponseWrapper
 	tmp = responseWrapper{
+		ctx:        ctx,
+		request:    req,
 		data:       r.Data,
 		isComplete: r.IsComplete,
 		metadata: metadataWrapper{
@@ -176,10 +191,8 @@ func executeResponseModifiers(respModifiers []func(interface{}) (interface{}, er
 	r.IsComplete = tmp.IsComplete()
 	r.Io = tmp.Io()
 	r.Metadata = Metadata{}
-	if m := tmp.Metadata(); m != nil {
-		r.Metadata.Headers = m.Headers()
-		r.Metadata.StatusCode = m.StatusCode()
-	}
+	r.Metadata.Headers = tmp.Headers()
+	r.Metadata.StatusCode = tmp.StatusCode()
 	return r, nil
 }
 
@@ -194,21 +207,30 @@ type RequestWrapper interface {
 	Path() string
 }
 
-// ResponseWrapper is an interface for passing proxy response metadata between the lura pipe and the loaded plugins
-type ResponseMetadataWrapper interface {
-	Headers() map[string][]string
-	StatusCode() int
-}
-
 // ResponseWrapper is an interface for passing proxy response between the lura pipe and the loaded plugins
 type ResponseWrapper interface {
 	Data() map[string]interface{}
 	Io() io.Reader
 	IsComplete() bool
-	Metadata() ResponseMetadataWrapper
+	Headers() map[string][]string
+	StatusCode() int
+}
+
+func newRequestWrapper(ctx context.Context, r *Request) *requestWrapper {
+	return &requestWrapper{
+		ctx:     ctx,
+		method:  r.Method,
+		url:     r.URL,
+		query:   r.Query,
+		path:    r.Path,
+		body:    r.Body,
+		params:  r.Params,
+		headers: r.Headers,
+	}
 }
 
 type requestWrapper struct {
+	ctx     context.Context
 	method  string
 	url     *url.URL
 	query   url.Values
@@ -218,13 +240,14 @@ type requestWrapper struct {
 	headers map[string][]string
 }
 
-func (r requestWrapper) Method() string               { return r.method }
-func (r requestWrapper) URL() *url.URL                { return r.url }
-func (r requestWrapper) Query() url.Values            { return r.query }
-func (r requestWrapper) Path() string                 { return r.path }
-func (r requestWrapper) Body() io.ReadCloser          { return r.body }
-func (r requestWrapper) Params() map[string]string    { return r.params }
-func (r requestWrapper) Headers() map[string][]string { return r.headers }
+func (r *requestWrapper) Context() context.Context     { return r.ctx }
+func (r *requestWrapper) Method() string               { return r.method }
+func (r *requestWrapper) URL() *url.URL                { return r.url }
+func (r *requestWrapper) Query() url.Values            { return r.query }
+func (r *requestWrapper) Path() string                 { return r.path }
+func (r *requestWrapper) Body() io.ReadCloser          { return r.body }
+func (r *requestWrapper) Params() map[string]string    { return r.params }
+func (r *requestWrapper) Headers() map[string][]string { return r.headers }
 
 type metadataWrapper struct {
 	headers    map[string][]string
@@ -235,13 +258,18 @@ func (m metadataWrapper) Headers() map[string][]string { return m.headers }
 func (m metadataWrapper) StatusCode() int              { return m.statusCode }
 
 type responseWrapper struct {
+	ctx        context.Context
+	request    interface{}
 	data       map[string]interface{}
 	isComplete bool
 	metadata   metadataWrapper
 	io         io.Reader
 }
 
-func (r responseWrapper) Data() map[string]interface{}      { return r.data }
-func (r responseWrapper) IsComplete() bool                  { return r.isComplete }
-func (r responseWrapper) Metadata() ResponseMetadataWrapper { return r.metadata }
-func (r responseWrapper) Io() io.Reader                     { return r.io }
+func (r responseWrapper) Context() context.Context     { return r.ctx }
+func (r responseWrapper) Request() interface{}         { return r.request }
+func (r responseWrapper) Data() map[string]interface{} { return r.data }
+func (r responseWrapper) IsComplete() bool             { return r.isComplete }
+func (r responseWrapper) Io() io.Reader                { return r.io }
+func (r responseWrapper) Headers() map[string][]string { return r.metadata.headers }
+func (r responseWrapper) StatusCode() int              { return r.metadata.statusCode }

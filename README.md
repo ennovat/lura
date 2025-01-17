@@ -7,6 +7,7 @@
 ![CII Best Practices](https://bestpractices.coreinfrastructure.org/projects/3151/badge)
 ![Docker Pulls](https://img.shields.io/docker/pulls/devopsfaith/krakend.svg)
 [![Slack Widget](https://img.shields.io/badge/join-us%20on%20slack-gray.svg?longCache=true&logo=slack&colorB=red)](https://gophers.slack.com/messages/lura)
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fluraproject%2Flura.svg?type=shield&issueType=license)](https://app.fossa.com/projects/git%2Bgithub.com%2Fluraproject%2Flura?ref=badge_shield&issueType=license)
 
 
 An open framework to assemble ultra performance API Gateways with middlewares; formerly known as _KrakenD framework_, and core service of the [KrakenD API Gateway](http://www.krakend.io).
@@ -48,11 +49,11 @@ The source code for the [Lura project](https://luraproject.org) framework. It is
 
 Use this repository if you want to **build from source your API Gateway** or if you want to **reuse the components in another application**.
 
-If you need a fully functional API Gateway you can [download the KrakenD binary for your architecture](http://www.krakend.io/download) or [build it yourself](https://github.com/devopsfaith/krakend-ce).
+If you need a fully functional API Gateway you can [download the KrakenD binary for your architecture](http://www.krakend.io/download) or [build it yourself](https://github.com/krakendio/krakend-ce).
 
 
 ## Library Usage
-The Lura project is presented as a **Go library** that you can include in your own Go application to build a powerful proxy or API gateway. In order to get you started several examples of implementations are included in the `examples` folder.
+The Lura project is presented as a **Go library** that you can include in your own Go application to build a powerful proxy or API gateway. For a complete example, check the [KrakenD CE repository](https://github.com/krakendio/krakend-ce).
 
 Of course, you will need [Go installed](https://golang.org/doc/install) in your system to compile the code.
 
@@ -99,18 +100,6 @@ A ready to use example:
 
 Visit the [framework overview](/docs/OVERVIEW.md) for more details about the components of the Lura project.
 
-### Examples
-
-You can find some implementation examples on [this KrakenD repository](https://github.com/devopsfaith/krakend-examples)
-
-1. [gin router](https://github.com/devopsfaith/krakend-examples/tree/master/gin/)
-2. [mux router](https://github.com/devopsfaith/krakend-examples/tree/master/mux/)
-3. [gorilla router](https://github.com/devopsfaith/krakend-examples/tree/master/gorilla/)
-4. [negroni middlewares](https://github.com/devopsfaith/krakend-examples/tree/master/negroni/)
-5. [dns srv service discovery](https://github.com/devopsfaith/krakend-examples/tree/master/dns/)
-6. [jwt middlewares](https://github.com/devopsfaith/krakend-examples/tree/master/jwt/)
-7. [httpcache based proxies](https://github.com/devopsfaith/krakend-examples/tree/master/httpcache/)
-
 ## Configuration file
 
 [Lura config file](/docs/CONFIG.md)
@@ -132,3 +121,7 @@ Read [CONTRIBUTING.md](/CONTRIBUTING.md) for more information.
 - **Read the [documentation](/docs/OVERVIEW.md)**
 
 Enjoy Lura!
+
+
+## License
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fluraproject%2Flura.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2Fluraproject%2Flura?ref=badge_large)

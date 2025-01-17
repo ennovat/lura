@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+
 package proxy
 
 import (
@@ -7,32 +8,9 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/luraproject/lura/config"
+	"github.com/luraproject/lura/v2/config"
+	"github.com/luraproject/lura/v2/logging"
 )
-
-func TestNewStaticMiddleware_multipleNext(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Error("The code did not panic")
-		}
-	}()
-	endpoint := config.EndpointConfig{
-		ExtraConfig: config.ExtraConfig{
-			Namespace: map[string]interface{}{
-				staticKey: map[string]interface{}{
-					"data": map[string]interface{}{
-						"new-1": true,
-						"new-2": map[string]interface{}{"k1": 42},
-						"new-3": "42",
-					},
-					"strategy": "incomplete",
-				},
-			},
-		},
-	}
-	mw := NewStaticMiddleware(&endpoint)
-	mw(explosiveProxy(t), explosiveProxy(t))
-}
 
 func TestNewStaticMiddleware_ok(t *testing.T) {
 	endpoint := config.EndpointConfig{
@@ -49,7 +27,7 @@ func TestNewStaticMiddleware_ok(t *testing.T) {
 			},
 		},
 	}
-	mw := NewStaticMiddleware(&endpoint)
+	mw := NewStaticMiddleware(logging.NoOp, &endpoint)
 
 	p := mw(dummyProxy(&Response{Data: map[string]interface{}{"supu": 42}, IsComplete: true}))
 	out1, err := p(context.Background(), &Request{})
@@ -119,7 +97,7 @@ func TestNewStaticMiddleware(t *testing.T) {
 		},
 	}
 
-	mw := NewStaticMiddleware(&config.EndpointConfig{ExtraConfig: extra})
+	mw := NewStaticMiddleware(logging.NoOp, &config.EndpointConfig{ExtraConfig: extra})
 
 	p := mw(func(_ context.Context, r *Request) (*Response, error) {
 		return &Response{IsComplete: true}, nil

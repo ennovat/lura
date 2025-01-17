@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+
 package proxy
 
 import (
@@ -14,9 +15,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luraproject/lura/config"
-	"github.com/luraproject/lura/encoding"
-	"github.com/luraproject/lura/transport/http/client"
+	"github.com/luraproject/lura/v2/config"
+	"github.com/luraproject/lura/v2/encoding"
+	"github.com/luraproject/lura/v2/transport/http/client"
 )
 
 func TestNewHTTPProxy_ok(t *testing.T) {
@@ -239,7 +240,7 @@ func TestNewHTTPProxy_badStatusCode_detailed(t *testing.T) {
 		t.Errorf("unexpected error code: %d", response.Metadata.StatusCode)
 	}
 	b, _ := json.Marshal(response.Data)
-	if string(b) != `{"error_some":{"http_status_code":500,"http_body":"booom\n"}}` {
+	if string(b) != `{"error_some":{"http_status_code":500,"http_body":"booom\n","http_body_encoding":"text/plain; charset=utf-8"}}` {
 		t.Errorf("unexpected response content: %s", string(b))
 	}
 	select {
@@ -397,17 +398,6 @@ func TestNewRequestBuilderMiddleware_ok(t *testing.T) {
 	if response != nil {
 		t.Errorf("We weren't expecting a response but we got one: %v\n", response)
 	}
-}
-
-func TestNewRequestBuilderMiddleware_multipleNext(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Errorf("The code did not panic\n")
-		}
-	}()
-	sampleBackend := config.Backend{}
-	mw := NewRequestBuilderMiddleware(&sampleBackend)
-	mw(explosiveProxy(t), explosiveProxy(t))
 }
 
 func TestDefaultHTTPResponseParserConfig_nopDecoder(t *testing.T) {

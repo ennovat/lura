@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+
 package proxy
 
 import (
@@ -8,9 +9,10 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/luraproject/lura/config"
-	"github.com/luraproject/lura/encoding"
-	"github.com/luraproject/lura/transport/http/client"
+	"github.com/luraproject/lura/v2/config"
+	"github.com/luraproject/lura/v2/encoding"
+	"github.com/luraproject/lura/v2/logging"
+	"github.com/luraproject/lura/v2/transport/http/client"
 )
 
 var httpProxy = CustomHTTPProxyFactory(client.NewHTTPClient)
@@ -45,30 +47,31 @@ func NewHTTPProxyWithHTTPExecutor(remote *config.Backend, re client.HTTPRequestE
 
 // NewHTTPProxyDetailed creates a http proxy with the injected configuration, HTTPRequestExecutor,
 // Decoder and HTTPResponseParser
-func NewHTTPProxyDetailed(remote *config.Backend, re client.HTTPRequestExecutor, ch client.HTTPStatusHandler, rp HTTPResponseParser) Proxy {
+func NewHTTPProxyDetailed(_ *config.Backend, re client.HTTPRequestExecutor, ch client.HTTPStatusHandler, rp HTTPResponseParser) Proxy {
 	return func(ctx context.Context, request *Request) (*Response, error) {
-		requestToBakend, err := http.NewRequest(strings.ToTitle(request.Method), request.URL.String(), request.Body)
+		requestToBackend, err := http.NewRequest(strings.ToTitle(request.Method), request.URL.String(), request.Body)
 		if err != nil {
 			return nil, err
 		}
-		requestToBakend.Header = make(map[string][]string, len(request.Headers))
+		requestToBackend.Header = make(map[string][]string, len(request.Headers))
 		for k, vs := range request.Headers {
 			tmp := make([]string, len(vs))
 			copy(tmp, vs)
-			requestToBakend.Header[k] = tmp
+			requestToBackend.Header[k] = tmp
 		}
 		if request.Body != nil {
 			if v, ok := request.Headers["Content-Length"]; ok && len(v) == 1 && v[0] != "chunked" {
 				if size, err := strconv.Atoi(v[0]); err == nil {
-					requestToBakend.ContentLength = int64(size)
+					requestToBackend.ContentLength = int64(size)
 				}
 			}
 		}
 
-		resp, err := re(ctx, requestToBakend)
-		if requestToBakend.Body != nil {
-			requestToBakend.Body.Close()
+		resp, err := re(ctx, requestToBackend)
+		if requestToBackend.Body != nil {
+			requestToBackend.Body.Close()
 		}
+
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -96,17 +99,25 @@ func NewHTTPProxyDetailed(remote *config.Backend, re client.HTTPRequestExecutor,
 }
 
 // NewRequestBuilderMiddleware creates a proxy middleware that parses the request params received
-// from the outter layer and generates the path to the backend endpoints
-func NewRequestBuilderMiddleware(remote *config.Backend) Middleware {
+// from the outer layer and generates the path to the backend endpoints
+var NewRequestBuilderMiddleware = func(remote *config.Backend) Middleware {
+	return newRequestBuilderMiddleware(logging.NoOp, remote)
+}
+
+func NewRequestBuilderMiddlewareWithLogger(logger logging.Logger, remote *config.Backend) Middleware {
+	return newRequestBuilderMiddleware(logger, remote)
+}
+
+func newRequestBuilderMiddleware(l logging.Logger, remote *config.Backend) Middleware {
 	return func(next ...Proxy) Proxy {
 		if len(next) > 1 {
-			panic(ErrTooManyProxies)
+			l.Fatal("too many proxies for this %s %s -> %s proxy middleware: newRequestBuilderMiddleware only accepts 1 proxy, got %d", remote.ParentEndpointMethod, remote.ParentEndpoint, remote.URLPattern, len(next))
+			return nil
 		}
-		return func(ctx context.Context, request *Request) (*Response, error) {
-			r := request.Clone()
+		return func(ctx context.Context, r *Request) (*Response, error) {
 			r.GeneratePath(remote.URLPattern)
 			r.Method = remote.Method
-			return next[0](ctx, &r)
+			return next[0](ctx, r)
 		}
 	}
 }

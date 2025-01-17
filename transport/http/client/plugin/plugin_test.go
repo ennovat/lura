@@ -1,19 +1,21 @@
+//go:build integration || !race
 // +build integration !race
 
 // SPDX-License-Identifier: Apache-2.0
+
 package plugin
 
 import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"testing"
 
-	"github.com/luraproject/lura/config"
-	"github.com/luraproject/lura/logging"
-	"github.com/luraproject/lura/transport/http/client"
+	"github.com/luraproject/lura/v2/config"
+	"github.com/luraproject/lura/v2/logging"
+	"github.com/luraproject/lura/v2/transport/http/client"
 )
 
 func TestLoadWithLogger(t *testing.T) {
@@ -30,6 +32,7 @@ func TestLoadWithLogger(t *testing.T) {
 
 	hre := HTTPRequestExecutor(l, func(_ *config.Backend) client.HTTPRequestExecutor {
 		t.Error("this factory should not been called")
+		t.Fail()
 		return nil
 	})
 
@@ -41,14 +44,14 @@ func TestLoadWithLogger(t *testing.T) {
 		},
 	})
 
-	req, _ := http.NewRequest("GET", "http://some.example.tld/path", nil)
+	req, _ := http.NewRequest("GET", "http://some.example.tld/path", http.NoBody)
 	resp, err := h(context.Background(), req)
 	if err != nil {
 		t.Errorf("unexpected error: %s", err.Error())
 		return
 	}
 
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Error(err)
 		return

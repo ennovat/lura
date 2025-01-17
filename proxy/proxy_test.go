@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+
 package proxy
 
 import (
@@ -23,15 +24,6 @@ func TestEmptyMiddleware_ok(t *testing.T) {
 	}
 }
 
-func TestEmptyMiddleware_multipleNext(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Errorf("The code did not panic\n")
-		}
-	}()
-	EmptyMiddleware(NoopProxy, NoopProxy)
-}
-
 func explosiveProxy(t *testing.T) Proxy {
 	return func(ctx context.Context, _ *Request) (*Response, error) {
 		t.Error("This proxy shouldn't been executed!")
@@ -45,7 +37,7 @@ func dummyProxy(r *Response) Proxy {
 	}
 }
 
-func delayedProxy(t *testing.T, timeout time.Duration, r *Response) Proxy {
+func delayedProxy(_ *testing.T, timeout time.Duration, r *Response) Proxy {
 	return func(ctx context.Context, _ *Request) (*Response, error) {
 		select {
 		case <-ctx.Done():
@@ -68,7 +60,7 @@ func (d dummyReadCloser) Read(p []byte) (int, error) {
 	return d.reader.Read(p)
 }
 
-func (d dummyReadCloser) Close() error {
+func (dummyReadCloser) Close() error {
 	return nil
 }
 

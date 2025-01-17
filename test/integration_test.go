@@ -1,6 +1,8 @@
+//go:build integration || !race
 // +build integration !race
 
 // SPDX-License-Identifier: Apache-2.0
+
 package test
 
 import (
@@ -9,34 +11,88 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"text/template"
 	"time"
 
-	"github.com/urfave/negroni"
+	ginlib "github.com/gin-gonic/gin"
+	"github.com/urfave/negroni/v2"
 
-	"github.com/luraproject/lura/config"
-	"github.com/luraproject/lura/logging"
-	"github.com/luraproject/lura/proxy"
-	"github.com/luraproject/lura/router/chi"
-	"github.com/luraproject/lura/router/gin"
-	"github.com/luraproject/lura/router/gorilla"
-	"github.com/luraproject/lura/router/httptreemux"
-	luranegroni "github.com/luraproject/lura/router/negroni"
+	"github.com/luraproject/lura/v2/config"
+	"github.com/luraproject/lura/v2/logging"
+	"github.com/luraproject/lura/v2/proxy"
+	"github.com/luraproject/lura/v2/router/chi"
+	"github.com/luraproject/lura/v2/router/gin"
+	"github.com/luraproject/lura/v2/router/gorilla"
+	"github.com/luraproject/lura/v2/router/httptreemux"
+	luranegroni "github.com/luraproject/lura/v2/router/negroni"
+	"github.com/luraproject/lura/v2/transport/http/server"
 )
 
+var localhostIP string
+
+func init() {
+	ln, err := net.Listen("tcp", ":8080")
+	if err != nil {
+		return
+	}
+
+	go func() {
+		conn, _ := net.Dial("tcp", "localhost:8080")
+		<-time.After(5 * time.Second)
+		conn.Close()
+	}()
+
+	conn, err := ln.Accept()
+	if err != nil {
+		return
+	}
+	h, _, err := net.SplitHostPort(conn.RemoteAddr().String())
+	if err == nil {
+		localhostIP = h
+	}
+	conn.Close()
+}
+
 func TestKrakenD_ginRouter(t *testing.T) {
+	ginlib.SetMode(ginlib.TestMode)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	testKrakenD(t, func(logger logging.Logger, cfg *config.ServiceConfig) {
-		gin.DefaultFactory(proxy.DefaultFactory(logger), logger).NewWithContext(ctx).Run(*cfg)
+		if cfg.ExtraConfig == nil {
+			cfg.ExtraConfig = map[string]interface{}{}
+		}
+		cfg.ExtraConfig[gin.Namespace] = map[string]interface{}{
+			"trusted_proxies":        []interface{}{"127.0.0.1/32", "::1"},
+			"remote_ip_headers":      []interface{}{"x-forwarded-for"},
+			"forwarded_by_client_ip": true,
+			"return_error_msg":       true,
+		}
+
+		ignoredChan := make(chan string)
+		opts := gin.EngineOptions{
+			Logger: logger,
+			Writer: io.Discard,
+			Health: (<-chan string)(ignoredChan),
+		}
+
+		gin.NewFactory(
+			gin.Config{
+				Engine:         gin.NewEngine(*cfg, opts),
+				Middlewares:    []ginlib.HandlerFunc{},
+				HandlerFactory: gin.EndpointHandler,
+				ProxyFactory:   proxy.DefaultFactory(logger),
+				Logger:         logger,
+				RunServer:      server.RunServer,
+			},
+		).NewWithContext(ctx).Run(*cfg)
 	})
 }
 
@@ -90,18 +146,10 @@ func testKrakenD(t *testing.T, runRouter func(logging.Logger, *config.ServiceCon
 		return
 	}
 
-	buf := new(bytes.Buffer)
-	logger, err := logging.NewLogger("DEBUG", buf, "[KRAKEND]")
-	if err != nil {
-		t.Error(err)
-		return
-	}
-
+	logger := logging.NoOp
 	go runRouter(logger, cfg)
 
-	select {
-	case <-time.After(300 * time.Millisecond):
-	}
+	<-time.After(300 * time.Millisecond)
 
 	defaultHeaders := map[string]string{
 		"Content-Type":        "application/json",
@@ -125,12 +173,6 @@ func testKrakenD(t *testing.T, runRouter func(logging.Logger, *config.ServiceCon
 		expHeaders    map[string]string
 		expStatusCode int
 	}{
-		{
-			name:    "health_check",
-			url:     "/__health",
-			headers: map[string]string{},
-			expBody: `{"status":"ok"}`,
-		},
 		{
 			name:       "static",
 			url:        "/static",
@@ -197,7 +239,7 @@ func testKrakenD(t *testing.T, runRouter func(logging.Logger, *config.ServiceCon
 			url:        "/detail_error",
 			headers:    map[string]string{},
 			expHeaders: incompleteHeader,
-			expBody:    `{"email":"some@email.com","error_backend_a":{"http_status_code":429,"http_body":"sad panda\n"},"name":"a"}`,
+			expBody:    `{"email":"some@email.com","error_backend_a":{"http_status_code":429,"http_body":"sad panda\n","http_body_encoding":"text/plain; charset=utf-8"},"name":"a"}`,
 		},
 		{
 			name:       "querystring-params-no-params",
@@ -318,6 +360,42 @@ func testKrakenD(t *testing.T, runRouter func(logging.Logger, *config.ServiceCon
 			url:        "/sequence-accept",
 			expHeaders: defaultHeaders,
 		},
+		{
+			method:        "GET",
+			name:          "error-status-code-1",
+			url:           "/error-status-code/1",
+			expStatusCode: 200,
+		},
+		{
+			method:        "GET",
+			name:          "error-status-code-2",
+			url:           "/error-status-code/2",
+			expStatusCode: 429,
+		},
+		{
+			method:        "GET",
+			name:          "error-status-code-3",
+			url:           "/error-status-code/3",
+			expStatusCode: 200,
+		},
+		{
+			method:        "POST",
+			name:          "multipost_parallel",
+			url:           "/multipost/parallel/foo",
+			body:          `{"foo":"bar"}`,
+			expStatusCode: 200,
+			expHeaders:    defaultHeaders,
+			expBody:       fmt.Sprintf(`{"first":{"body":"{\"foo\":\"bar\"}","headers":{"Accept-Encoding":["gzip"],"User-Agent":["KrakenD Version undefined"],"X-Forwarded-For":["`+localhostIP+`"],"X-Forwarded-Host":["localhost:%d"]},"method":"POST","url":"/provider/foo"},"second":{"body":"{\"foo\":\"bar\"}","headers":{"Accept-Encoding":["gzip"],"User-Agent":["KrakenD Version undefined"],"X-Forwarded-For":["`+localhostIP+`"],"X-Forwarded-Host":["localhost:%d"]},"method":"POST","url":"/recipient/foo"}}`, cfg.Port, cfg.Port),
+		},
+		{
+			method:        "POST",
+			name:          "multipost_sequential",
+			url:           "/multipost/sequential/foo",
+			body:          `{"foo":"bar"}`,
+			expStatusCode: 200,
+			expHeaders:    defaultHeaders,
+			expBody:       fmt.Sprintf(`{"first":{"path":"/provider/foo","random":42},"second":{"body":"{\"foo\":\"bar\"}","headers":{"Accept-Encoding":["gzip"],"User-Agent":["KrakenD Version undefined"],"X-Forwarded-For":["`+localhostIP+`"],"X-Forwarded-Host":["localhost:%d"]},"method":"POST","url":"/recipient/42"},"third":{"body":"{\"foo\":\"bar\"}","headers":{"Accept-Encoding":["gzip"],"User-Agent":["KrakenD Version undefined"],"X-Forwarded-For":["`+localhostIP+`"],"X-Forwarded-Host":["localhost:%d"]},"method":"POST","url":"/recipient/42"}}`, cfg.Port, cfg.Port),
+		},
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
@@ -346,6 +424,7 @@ func testKrakenD(t *testing.T, runRouter func(logging.Logger, *config.ServiceCon
 				t.Errorf("%s: nil response", resp.Request.URL.Path)
 				return
 			}
+
 			expectedStatusCode := http.StatusOK
 			if tc.expStatusCode != 0 {
 				expectedStatusCode = tc.expStatusCode
@@ -363,15 +442,19 @@ func testKrakenD(t *testing.T, runRouter func(logging.Logger, *config.ServiceCon
 				return
 			}
 
-			b, _ := ioutil.ReadAll(resp.Body)
+			b, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			if tc.expBody != string(b) {
-				t.Errorf("%s: unexpected body: %s", resp.Request.URL.Path, string(b))
-				fmt.Println(resp.Request.URL.Path, "was expecting:", tc.expBody)
+				t.Errorf(
+					"%s: unexpected body: %s\n\t%s was expecting: %s",
+					resp.Request.URL.Path,
+					string(b),
+					resp.Request.URL.Path,
+					tc.expBody,
+				)
 			}
 		})
 	}
-
 }
 
 func setupBackend(t *testing.T) (*config.ServiceConfig, error) {
@@ -394,7 +477,7 @@ func setupBackend(t *testing.T) (*config.ServiceConfig, error) {
 			http.Error(rw, "bad X-Y-Z", 400)
 			return
 		}
-		body, err := ioutil.ReadAll(r.Body)
+		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Error(err)
 			return
@@ -427,7 +510,7 @@ func setupBackend(t *testing.T) (*config.ServiceConfig, error) {
 
 	// crasher backend
 	b4 := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		http.Error(rw, "sad panda", 429)
+		http.Error(rw, "sad panda", http.StatusTooManyRequests)
 	}))
 	data["b4"] = b4.URL
 
@@ -483,6 +566,20 @@ func setupBackend(t *testing.T) (*config.ServiceConfig, error) {
 	}))
 	data["b11"] = b11.URL
 
+	// Echo backend
+	b12 := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		rw.Header().Add("Content-Type", "application/json")
+		b, _ := io.ReadAll(r.Body)
+		r.Body.Close()
+		json.NewEncoder(rw).Encode(map[string]interface{}{
+			"headers": r.Header,
+			"body":    string(b),
+			"url":     r.URL.String(),
+			"method":  r.Method,
+		})
+	}))
+	data["b12"] = b12.URL
+
 	c, err := loadConfig(data)
 	if err != nil {
 		return nil, err
@@ -492,7 +589,7 @@ func setupBackend(t *testing.T) (*config.ServiceConfig, error) {
 }
 
 func loadConfig(data map[string]interface{}) (*config.ServiceConfig, error) {
-	content, _ := ioutil.ReadFile("lura.json")
+	content, _ := os.ReadFile("lura.json")
 	tmpl, err := template.New("test").Parse(string(content))
 	if err != nil {
 		return nil, err

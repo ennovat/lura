@@ -1,5 +1,5 @@
-//go:generate openssl req -newkey rsa:2048 -new -nodes -x509 -days 3650 -out cert.pem -keyout key.pem -subj "/C=US/ST=California/L=Mountain View/O=Your Organization/OU=Your Unit/CN=localhost"
 // SPDX-License-Identifier: Apache-2.0
+
 package server
 
 import (
@@ -9,14 +9,18 @@ import (
 	"errors"
 	"fmt"
 	"html"
-	"io/ioutil"
 	"log"
 	"math/rand"
+	"net"
 	"net/http"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/luraproject/lura/config"
+	"github.com/luraproject/lura/v2/config"
+	"github.com/luraproject/lura/v2/logging"
+	"golang.org/x/net/http2"
 )
 
 func init() {
@@ -40,6 +44,7 @@ func TestRunServer_TLS(t *testing.T) {
 				TLS: &config.TLS{
 					PublicKey:  "cert.pem",
 					PrivateKey: "key.pem",
+					CaCerts:    []string{"ca.pem"},
 				},
 			},
 			http.HandlerFunc(dummyHandler),
@@ -63,6 +68,26 @@ func TestRunServer_TLS(t *testing.T) {
 		t.Errorf("unexpected status code: %d", resp.StatusCode)
 		return
 	}
+
+	// now lets initialize the global default transport and use a regular
+	// client to connect to the server
+	InitHTTPDefaultTransport(config.ServiceConfig{
+		ClientTLS: &config.ClientTLS{
+			CaCerts:             []string{"ca.pem"},
+			DisableSystemCaPool: true,
+		},
+	})
+	rawClient := http.Client{}
+	resp, err = rawClient.Get(fmt.Sprintf("https://localhost:%d", port))
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	if resp.StatusCode != 200 {
+		t.Errorf("unexpected status code: %d", resp.StatusCode)
+		return
+	}
+
 	cancel()
 
 	if err = <-done; err != nil {
@@ -76,22 +101,30 @@ func TestRunServer_MTLS(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	port := newPort()
-	port = 36517
+	port := 36517
 	done := make(chan error)
-	go func() {
-		done <- RunServer(
-			ctx,
-			config.ServiceConfig{
-				Port: port,
-				TLS: &config.TLS{
-					PublicKey:  "cert.pem",
-					PrivateKey: "key.pem",
-					EnableMTLS: true,
+
+	cfg := config.ServiceConfig{
+		Port: port,
+		TLS: &config.TLS{
+			PublicKey:  "cert.pem",
+			PrivateKey: "key.pem",
+			CaCerts:    []string{"ca.pem"},
+			EnableMTLS: true,
+		},
+		ClientTLS: &config.ClientTLS{
+			AllowInsecureConnections: false, // we do not check the server cert
+			CaCerts:                  []string{"ca.pem"},
+			ClientCerts: []config.ClientTLSCert{
+				{
+					Certificate: "cert.pem",
+					PrivateKey:  "key.pem",
 				},
 			},
-			http.HandlerFunc(dummyHandler),
-		)
+		},
+	}
+	go func() {
+		done <- RunServer(ctx, cfg, http.HandlerFunc(dummyHandler))
 	}()
 
 	client, err := mtlsClient("cert.pem", "key.pem")
@@ -111,6 +144,29 @@ func TestRunServer_MTLS(t *testing.T) {
 		t.Errorf("unexpected status code: %d", resp.StatusCode)
 		return
 	}
+
+	logger := logging.NoOp
+	// since test are run in a suite, and `InitHTTPDefaultTransportWithLogger` is
+	// used to setup the `http.DefaultTransport` global variable once, we need to
+	// create a client here like if it was using the default created with the
+	// clientTLS config.
+	// This is a copy of the code we can find inside
+	// InitHTTPDefaultTransportWithLogger(serviceConfig, nil):
+	transport := NewTransport(cfg, logger)
+
+	defClient := http.Client{
+		Transport: transport,
+	}
+	resp, err = defClient.Get(fmt.Sprintf("https://localhost:%d", port))
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	if resp.StatusCode != 200 {
+		t.Errorf("unexpected status code: %d", resp.StatusCode)
+		return
+	}
+
 	cancel()
 
 	if err = <-done; err != nil {
@@ -136,6 +192,43 @@ func TestRunServer_plain(t *testing.T) {
 	<-time.After(100 * time.Millisecond)
 
 	resp, err := http.Get(fmt.Sprintf("http://localhost:%d", port))
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	if resp.StatusCode != 200 {
+		t.Errorf("unexpected status code: %d", resp.StatusCode)
+		return
+	}
+	cancel()
+
+	if err = <-done; err != nil {
+		t.Error(err)
+	}
+}
+
+func TestRunServer_h2c(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	port := newPort()
+
+	done := make(chan error)
+	go func() {
+		done <- RunServer(
+			ctx,
+			config.ServiceConfig{
+				Port:   port,
+				UseH2C: true,
+			},
+			http.HandlerFunc(dummyHandler),
+		)
+	}()
+
+	<-time.After(100 * time.Millisecond)
+
+	client := h2cClient()
+	resp, err := client.Get(fmt.Sprintf("http://localhost:%d", port))
 	if err != nil {
 		t.Error(err)
 		return
@@ -260,7 +353,7 @@ func Test_parseTLSVersion(t *testing.T) {
 
 func Test_parseCurveIDs(t *testing.T) {
 	original := []uint16{1, 2, 3}
-	cs := parseCurveIDs(&config.TLS{CurvePreferences: original})
+	cs := parseCurveIDs(original)
 	for k, v := range cs {
 		if original[k] != uint16(v) {
 			t.Errorf("unexpected curves %v. expected: %v", cs, original)
@@ -270,7 +363,7 @@ func Test_parseCurveIDs(t *testing.T) {
 
 func Test_parseCipherSuites(t *testing.T) {
 	original := []uint16{1, 2, 3}
-	cs := parseCipherSuites(&config.TLS{CipherSuites: original})
+	cs := parseCipherSuites(original)
 	for k, v := range cs {
 		if original[k] != uint16(v) {
 			t.Errorf("unexpected ciphersuites %v. expected: %v", cs, original)
@@ -283,7 +376,7 @@ func dummyHandler(rw http.ResponseWriter, req *http.Request) {
 }
 
 func testKeysAreAvailable(t *testing.T) {
-	files, err := ioutil.ReadDir(".")
+	files, err := os.ReadDir(".")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -303,7 +396,7 @@ func testKeysAreAvailable(t *testing.T) {
 }
 
 func httpsClient(cert string) (*http.Client, error) {
-	cer, err := ioutil.ReadFile(cert)
+	cer, err := os.ReadFile(cert)
 	if err != nil {
 		return nil, err
 	}
@@ -335,7 +428,7 @@ func mtlsClient(certPath, keyPath string) (*http.Client, error) {
 		return nil, err
 	}
 
-	cacer, err := ioutil.ReadFile(certPath)
+	cacer, err := os.ReadFile(certPath)
 	if err != nil {
 		return nil, err
 	}
@@ -362,7 +455,124 @@ func mtlsClient(certPath, keyPath string) (*http.Client, error) {
 	return &http.Client{Transport: &http.Transport{TLSClientConfig: tlsConf}}, nil
 }
 
+// h2cClient initializes client which executes cleartext http2 requests
+func h2cClient() *http.Client {
+	return &http.Client{
+		Transport: &http2.Transport{
+			DialTLSContext: func(_ context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+				return net.Dial(network, addr)
+			},
+			AllowHTTP: true,
+		},
+	}
+}
+
 // newPort returns random port numbers to avoid port collisions during the tests
 func newPort() int {
 	return 16666 + rand.Intn(40000)
+}
+
+func TestRunServer_MultipleTLS(t *testing.T) {
+	testKeysAreAvailable(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	port := newPort()
+
+	done := make(chan error)
+	go func() {
+		done <- RunServer(
+			ctx,
+			config.ServiceConfig{
+				Port: port,
+				TLS: &config.TLS{
+					CaCerts: []string{"ca.pem", "exampleca.pem"},
+					Keys: []config.TLSKeyPair{
+						{
+							PublicKey:  "cert.pem",
+							PrivateKey: "key.pem",
+						},
+						{
+							PublicKey:  "examplecert.pem",
+							PrivateKey: "examplekey.pem",
+						},
+					},
+				},
+			},
+			http.HandlerFunc(dummyHandler),
+		)
+	}()
+
+	client, err := httpsClient("cert.pem")
+	if err != nil {
+		t.Error(err)
+		return
+	}
+
+	<-time.After(100 * time.Millisecond)
+
+	resp, err := client.Get(fmt.Sprintf("https://localhost:%d", port))
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	if resp.StatusCode != 200 {
+		t.Errorf("unexpected status code: %d", resp.StatusCode)
+		return
+	}
+
+	client, err = httpsClient("examplecert.pem")
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	_, err = client.Get(fmt.Sprintf("https://127.0.0.1:%d", port))
+	// should fail, because it will be served with cert.pem
+	if err == nil || strings.Contains(err.Error(), "bad certificate") {
+		t.Error("expected to have 'bad certificate' error")
+		return
+	}
+
+	req, _ := http.NewRequest("GET", fmt.Sprintf("https://example.com:%d", port), http.NoBody)
+	overrideHostTransport(client)
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	if resp.StatusCode != 200 {
+		t.Errorf("unexpected status code: %d", resp.StatusCode)
+		return
+	}
+
+	cancel()
+	if err = <-done; err != nil {
+		t.Error(err)
+	}
+}
+
+// overrideHostTransport subtitutes the actual address that the request will
+// connecto (overriding the dns resolution).
+func overrideHostTransport(client *http.Client) {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	if client.Transport != nil {
+		if tt, ok := client.Transport.(*http.Transport); ok {
+			t = tt
+		}
+	}
+	myDialer := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+		DualStack: true,
+	}
+	t.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		_, port, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, err
+		}
+		overrideAddress := net.JoinHostPort("127.0.0.1", port)
+		return myDialer.DialContext(ctx, network, overrideAddress)
+	}
+	client.Transport = t
 }

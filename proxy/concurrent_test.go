@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+
 package proxy
 
 import (
@@ -7,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luraproject/lura/config"
+	"github.com/luraproject/lura/v2/config"
 )
 
 func TestNewConcurrentMiddleware_ok(t *testing.T) {
@@ -124,25 +125,4 @@ func TestNewConcurrentMiddleware_timeout(t *testing.T) {
 		return
 	default:
 	}
-}
-
-func TestNewConcurrentMiddleware_multipleNext(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Errorf("The code did not panic\n")
-		}
-	}()
-	backend := config.Backend{ConcurrentCalls: 2}
-	mw := NewConcurrentMiddleware(&backend)
-	mw(explosiveProxy(t), explosiveProxy(t))
-}
-
-func TestNewConcurrentMiddleware_insuficientConcurrentCalls(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Errorf("The code did not panic\n")
-		}
-	}()
-	backend := config.Backend{ConcurrentCalls: 1}
-	NewConcurrentMiddleware(&backend)
 }

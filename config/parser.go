@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
+
 package config
 
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"time"
 )
@@ -23,7 +23,7 @@ func (f ParserFunc) Parse(configFile string) (ServiceConfig, error) { return f(c
 
 // NewParser creates a new parser using the json library
 func NewParser() Parser {
-	return NewParserWithFileReader(ioutil.ReadFile)
+	return NewParserWithFileReader(os.ReadFile)
 }
 
 // NewParserWithFileReader returns a Parser with the injected FileReaderFunc function
@@ -76,7 +76,7 @@ func CheckErr(err error, configFile string) error {
 
 // NewParseError returns a new ParseError
 func NewParseError(err error, configFile string, offset int) *ParseError {
-	b, _ := ioutil.ReadFile(configFile)
+	b, _ := os.ReadFile(configFile)
 	row, col := getErrorRowCol(b, offset)
 	return &ParseError{
 		ConfigFile: configFile,
@@ -88,6 +88,9 @@ func NewParseError(err error, configFile string, offset int) *ParseError {
 }
 
 func getErrorRowCol(source []byte, offset int) (row, col int) {
+	if len(source) < offset {
+		offset = len(source) - 1
+	}
 	for i := 0; i < offset; i++ {
 		v := source[i]
 		if v == '\r' {
@@ -131,18 +134,22 @@ type FileReaderFunc func(string) ([]byte, error)
 type parseableServiceConfig struct {
 	Name                  string                     `json:"name"`
 	Endpoints             []*parseableEndpointConfig `json:"endpoints"`
+	AsyncAgents           []*parseableAsyncAgent     `json:"async_agent"`
 	Timeout               string                     `json:"timeout"`
 	CacheTTL              string                     `json:"cache_ttl"`
 	Host                  []string                   `json:"host"`
 	Port                  int                        `json:"port"`
+	Address               string                     `json:"listen_ip"`
 	Version               int                        `json:"version"`
 	ExtraConfig           *ExtraConfig               `json:"extra_config,omitempty"`
 	ReadTimeout           string                     `json:"read_timeout"`
 	WriteTimeout          string                     `json:"write_timeout"`
 	IdleTimeout           string                     `json:"idle_timeout"`
 	ReadHeaderTimeout     string                     `json:"read_header_timeout"`
+	MaxHeaderBytes        int                        `json:"max_header_bytes"`
 	DisableKeepAlives     bool                       `json:"disable_keep_alives"`
 	DisableCompression    bool                       `json:"disable_compression"`
+	DisableStrictREST     bool                       `json:"disable_rest"`
 	MaxIdleConns          int                        `json:"max_idle_connections"`
 	MaxIdleConnsPerHost   int                        `json:"max_idle_connections_per_host"`
 	IdleConnTimeout       string                     `json:"idle_connection_timeout"`
@@ -152,9 +159,13 @@ type parseableServiceConfig struct {
 	DialerTimeout         string                     `json:"dialer_timeout"`
 	DialerFallbackDelay   string                     `json:"dialer_fallback_delay"`
 	DialerKeepAlive       string                     `json:"dialer_keep_alive"`
-	Debug                 bool
-	Plugin                *Plugin       `json:"plugin,omitempty"`
-	TLS                   *parseableTLS `json:"tls,omitempty"`
+	Debug                 bool                       `json:"debug_endpoint"`
+	Echo                  bool                       `json:"echo_endpoint"`
+	Plugin                *Plugin                    `json:"plugin,omitempty"`
+	TLS                   *parseableTLS              `json:"tls,omitempty"`
+	ClientTLS             *parseableClientTLS        `json:"client_tls,omitempty"`
+	UseH2C                bool                       `json:"use_h2c,omitempty"`
+	DNSCacheTTL           string                     `json:"dns_cache_ttl"`
 }
 
 func (p *parseableServiceConfig) normalize() ServiceConfig {
@@ -164,14 +175,18 @@ func (p *parseableServiceConfig) normalize() ServiceConfig {
 		CacheTTL:              parseDuration(p.CacheTTL),
 		Host:                  p.Host,
 		Port:                  p.Port,
+		Address:               p.Address,
 		Version:               p.Version,
 		Debug:                 p.Debug,
+		Echo:                  p.Echo,
 		ReadTimeout:           parseDuration(p.ReadTimeout),
 		WriteTimeout:          parseDuration(p.WriteTimeout),
 		IdleTimeout:           parseDuration(p.IdleTimeout),
 		ReadHeaderTimeout:     parseDuration(p.ReadHeaderTimeout),
+		MaxHeaderBytes:        p.MaxHeaderBytes,
 		DisableKeepAlives:     p.DisableKeepAlives,
 		DisableCompression:    p.DisableCompression,
+		DisableStrictREST:     p.DisableStrictREST,
 		MaxIdleConns:          p.MaxIdleConns,
 		MaxIdleConnsPerHost:   p.MaxIdleConnsPerHost,
 		IdleConnTimeout:       parseDuration(p.IdleConnTimeout),
@@ -182,18 +197,40 @@ func (p *parseableServiceConfig) normalize() ServiceConfig {
 		DialerKeepAlive:       parseDuration(p.DialerKeepAlive),
 		OutputEncoding:        p.OutputEncoding,
 		Plugin:                p.Plugin,
+		UseH2C:                p.UseH2C,
+		DNSCacheTTL:           parseDuration(p.DNSCacheTTL),
 	}
 	if p.TLS != nil {
 		cfg.TLS = &TLS{
 			IsDisabled:               p.TLS.IsDisabled,
 			PublicKey:                p.TLS.PublicKey,
 			PrivateKey:               p.TLS.PrivateKey,
+			CaCerts:                  p.TLS.CaCerts,
 			MinVersion:               p.TLS.MinVersion,
 			MaxVersion:               p.TLS.MaxVersion,
 			CurvePreferences:         p.TLS.CurvePreferences,
 			PreferServerCipherSuites: p.TLS.PreferServerCipherSuites,
 			CipherSuites:             p.TLS.CipherSuites,
 			EnableMTLS:               p.TLS.EnableMTLS,
+			DisableSystemCaPool:      p.TLS.DisableSystemCaPool,
+		}
+		for _, k := range p.TLS.Keys {
+			cfg.TLS.Keys = append(cfg.TLS.Keys, TLSKeyPair(k))
+		}
+	}
+	if p.ClientTLS != nil {
+		cfg.ClientTLS = &ClientTLS{
+			AllowInsecureConnections: p.ClientTLS.AllowInsecureConnections,
+			CaCerts:                  p.ClientTLS.CaCerts,
+			DisableSystemCaPool:      p.ClientTLS.DisableSystemCaPool,
+			MinVersion:               p.ClientTLS.MinVersion,
+			MaxVersion:               p.ClientTLS.MaxVersion,
+			CurvePreferences:         p.ClientTLS.CurvePreferences,
+			CipherSuites:             p.ClientTLS.CipherSuites,
+			ClientCerts:              make([]ClientTLSCert, 0, len(p.ClientTLS.ClientCerts)),
+		}
+		for _, cc := range p.ClientTLS.ClientCerts {
+			cfg.ClientTLS.ClientCerts = append(cfg.ClientTLS.ClientCerts, ClientTLSCert(cc))
 		}
 	}
 	if p.ExtraConfig != nil {
@@ -204,19 +241,48 @@ func (p *parseableServiceConfig) normalize() ServiceConfig {
 		endpoints = append(endpoints, e.normalize())
 	}
 	cfg.Endpoints = endpoints
+	agents := make([]*AsyncAgent, 0, len(p.AsyncAgents))
+	for _, a := range p.AsyncAgents {
+		agents = append(agents, a.normalize())
+	}
+	cfg.AsyncAgents = agents
 	return cfg
 }
 
+type parseableTLSKeyPair struct {
+	PublicKey  string `json:"public_key"`
+	PrivateKey string `json:"private_key"`
+}
+
 type parseableTLS struct {
-	IsDisabled               bool     `json:"disabled"`
-	PublicKey                string   `json:"public_key"`
-	PrivateKey               string   `json:"private_key"`
-	MinVersion               string   `json:"min_version"`
-	MaxVersion               string   `json:"max_version"`
-	CurvePreferences         []uint16 `json:"curve_preferences"`
-	PreferServerCipherSuites bool     `json:"prefer_server_cipher_suites"`
-	CipherSuites             []uint16 `json:"cipher_suites"`
-	EnableMTLS               bool     `json:"enable_mtls"`
+	IsDisabled               bool                  `json:"disabled"`
+	PublicKey                string                `json:"public_key"`
+	PrivateKey               string                `json:"private_key"`
+	CaCerts                  []string              `json:"ca_certs"`
+	MinVersion               string                `json:"min_version"`
+	MaxVersion               string                `json:"max_version"`
+	CurvePreferences         []uint16              `json:"curve_preferences"`
+	PreferServerCipherSuites bool                  `json:"prefer_server_cipher_suites"`
+	CipherSuites             []uint16              `json:"cipher_suites"`
+	EnableMTLS               bool                  `json:"enable_mtls"`
+	DisableSystemCaPool      bool                  `json:"disable_system_ca_pool"`
+	Keys                     []parseableTLSKeyPair `json:"keys"`
+}
+
+type parseableClientTLS struct {
+	AllowInsecureConnections bool                     `json:"allow_insecure_connections"`
+	CaCerts                  []string                 `json:"ca_certs"`
+	DisableSystemCaPool      bool                     `json:"disable_system_ca_pool"`
+	MinVersion               string                   `json:"min_version"`
+	MaxVersion               string                   `json:"max_version"`
+	CurvePreferences         []uint16                 `json:"curve_preferences"`
+	CipherSuites             []uint16                 `json:"cipher_suites"`
+	ClientCerts              []parseableClientTLSCert `json:"client_certs"`
+}
+
+type parseableClientTLSCert struct {
+	Certificate string `json:"certificate"`
+	PrivateKey  string `json:"private_key"`
 }
 
 type parseableEndpointConfig struct {
@@ -225,10 +291,10 @@ type parseableEndpointConfig struct {
 	Backend         []*parseableBackend `json:"backend"`
 	ConcurrentCalls int                 `json:"concurrent_calls"`
 	Timeout         string              `json:"timeout"`
-	CacheTTL        int                 `json:"cache_ttl"`
-	QueryString     []string            `json:"querystring_params"`
+	CacheTTL        string              `json:"cache_ttl"`
+	QueryString     []string            `json:"input_query_strings"`
 	ExtraConfig     *ExtraConfig        `json:"extra_config,omitempty"`
-	HeadersToPass   []string            `json:"headers_to_pass"`
+	HeadersToPass   []string            `json:"input_headers"`
 	OutputEncoding  string              `json:"output_encoding"`
 }
 
@@ -238,7 +304,7 @@ func (p *parseableEndpointConfig) normalize() *EndpointConfig {
 		Method:          p.Method,
 		ConcurrentCalls: p.ConcurrentCalls,
 		Timeout:         parseDuration(p.Timeout),
-		CacheTTL:        time.Duration(p.CacheTTL) * time.Second,
+		CacheTTL:        parseDuration(p.CacheTTL),
 		QueryString:     p.QueryString,
 		HeadersToPass:   p.HeadersToPass,
 		OutputEncoding:  p.OutputEncoding,
@@ -254,14 +320,57 @@ func (p *parseableEndpointConfig) normalize() *EndpointConfig {
 	return &e
 }
 
+type parseableAsyncAgent struct {
+	Name       string `json:"name"`
+	Connection struct {
+		MaxRetries      int    `json:"max_retries"`
+		BackoffStrategy string `json:"backoff_strategy"`
+		HealthInterval  string `json:"health_interval"`
+	} `json:"connection"`
+	Consumer struct {
+		Timeout string  `json:"timeout"`
+		Workers int     `json:"workers"`
+		Topic   string  `json:"topic"`
+		MaxRate float64 `json:"max_rate"`
+	} `json:"consumer"`
+	Encoding    string              `json:"encoding"`
+	Backend     []*parseableBackend `json:"backend"`
+	ExtraConfig ExtraConfig         `json:"extra_config"`
+}
+
+func (p *parseableAsyncAgent) normalize() *AsyncAgent {
+	e := AsyncAgent{
+		Name:     p.Name,
+		Encoding: p.Encoding,
+		Connection: Connection{
+			MaxRetries:      p.Connection.MaxRetries,
+			BackoffStrategy: p.Connection.BackoffStrategy,
+			HealthInterval:  parseDuration(p.Connection.HealthInterval),
+		},
+		Consumer: Consumer{
+			Timeout: parseDuration(p.Consumer.Timeout),
+			Workers: p.Consumer.Workers,
+			Topic:   p.Consumer.Topic,
+			MaxRate: p.Consumer.MaxRate,
+		},
+	}
+	if p.ExtraConfig != nil {
+		e.ExtraConfig = p.ExtraConfig
+	}
+	backends := make([]*Backend, 0, len(p.Backend))
+	for _, b := range p.Backend {
+		backends = append(backends, b.normalize())
+	}
+	e.Backend = backends
+	return &e
+}
+
 type parseableBackend struct {
 	Group                    string            `json:"group"`
 	Method                   string            `json:"method"`
 	Host                     []string          `json:"host"`
 	HostSanitizationDisabled bool              `json:"disable_host_sanitize"`
 	URLPattern               string            `json:"url_pattern"`
-	Blacklist                []string          `json:"blacklist"`
-	Whitelist                []string          `json:"whitelist"`
 	AllowList                []string          `json:"allow"`
 	DenyList                 []string          `json:"deny"`
 	Mapping                  map[string]string `json:"mapping"`
@@ -270,6 +379,9 @@ type parseableBackend struct {
 	Target                   string            `json:"target"`
 	ExtraConfig              *ExtraConfig      `json:"extra_config,omitempty"`
 	SD                       string            `json:"sd"`
+	HeadersToPass            []string          `json:"input_headers"`
+	SDScheme                 string            `json:"sd_scheme"`
+	QueryStringsToPass       []string          `json:"input_query_strings"`
 }
 
 func (p *parseableBackend) normalize() *Backend {
@@ -279,15 +391,19 @@ func (p *parseableBackend) normalize() *Backend {
 		Host:                     p.Host,
 		HostSanitizationDisabled: p.HostSanitizationDisabled,
 		URLPattern:               p.URLPattern,
-		Blacklist:                p.Blacklist,
-		Whitelist:                p.Whitelist,
 		Mapping:                  p.Mapping,
 		Encoding:                 p.Encoding,
 		IsCollection:             p.IsCollection,
 		Target:                   p.Target,
 		SD:                       p.SD,
+		SDScheme:                 p.SDScheme,
 		AllowList:                p.AllowList,
 		DenyList:                 p.DenyList,
+		HeadersToPass:            p.HeadersToPass,
+		QueryStringsToPass:       p.QueryStringsToPass,
+	}
+	if b.SDScheme == "" {
+		b.SDScheme = "http"
 	}
 	if p.ExtraConfig != nil {
 		b.ExtraConfig = *p.ExtraConfig

@@ -1,18 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
+
 package client
 
 import (
 	"bytes"
 	"context"
-	"io/ioutil"
+	"fmt"
+	"io"
 	"net/http"
 	"testing"
 
-	"github.com/luraproject/lura/config"
+	"github.com/luraproject/lura/v2/config"
 )
 
 func TestDetailedHTTPStatusHandler(t *testing.T) {
 	expectedErrName := "some"
+	expectedEncoding := "application/json; charset=utf-8"
 	cfg := &config.Backend{
 		ExtraConfig: config.ExtraConfig{
 			Namespace: map[string]interface{}{
@@ -25,7 +28,7 @@ func TestDetailedHTTPStatusHandler(t *testing.T) {
 	for _, code := range []int{http.StatusOK, http.StatusCreated} {
 		resp := &http.Response{
 			StatusCode: code,
-			Body:       ioutil.NopCloser(bytes.NewBufferString(`{"foo":"bar"}`)),
+			Body:       io.NopCloser(bytes.NewBufferString(`{"foo":"bar"}`)),
 		}
 
 		r, err := sh(context.Background(), resp)
@@ -46,7 +49,8 @@ func TestDetailedHTTPStatusHandler(t *testing.T) {
 
 		resp := &http.Response{
 			StatusCode: code,
-			Body:       ioutil.NopCloser(bytes.NewBufferString(msg)),
+			Body:       io.NopCloser(bytes.NewBufferString(fmt.Sprintf(`{"msg":%q}`, msg))),
+			Header:     http.Header{"Content-Type": []string{expectedEncoding}},
 		}
 
 		r, err := sh(context.Background(), resp)
@@ -56,7 +60,7 @@ func TestDetailedHTTPStatusHandler(t *testing.T) {
 			return
 		}
 
-		e, ok := err.(HTTPResponseError)
+		e, ok := err.(NamedHTTPResponseError)
 		if !ok {
 			t.Errorf("#%d unexpected error type %T: %s", i, err, err.Error())
 			return
@@ -67,7 +71,7 @@ func TestDetailedHTTPStatusHandler(t *testing.T) {
 			return
 		}
 
-		if e.Error() != msg {
+		if e.Error() != fmt.Sprintf(`{"msg":%q}`, msg) {
 			t.Errorf("#%d unexpected message: %s", i, e.Msg)
 			return
 		}
@@ -75,6 +79,10 @@ func TestDetailedHTTPStatusHandler(t *testing.T) {
 		if e.Name() != expectedErrName {
 			t.Errorf("#%d unexpected error name: %s", i, e.name)
 			return
+		}
+
+		if e.Encoding() != expectedEncoding {
+			t.Errorf("#%d unexpected encoding: %s", i, e.Enc)
 		}
 	}
 }
@@ -85,7 +93,7 @@ func TestDefaultHTTPStatusHandler(t *testing.T) {
 	for _, code := range []int{http.StatusOK, http.StatusCreated} {
 		resp := &http.Response{
 			StatusCode: code,
-			Body:       ioutil.NopCloser(bytes.NewBufferString(`{"foo":"bar"}`)),
+			Body:       io.NopCloser(bytes.NewBufferString(`{"foo":"bar"}`)),
 		}
 
 		r, err := sh(context.Background(), resp)
@@ -106,7 +114,7 @@ func TestDefaultHTTPStatusHandler(t *testing.T) {
 
 		resp := &http.Response{
 			StatusCode: code,
-			Body:       ioutil.NopCloser(bytes.NewBufferString(msg)),
+			Body:       io.NopCloser(bytes.NewBufferString(msg)),
 		}
 
 		r, err := sh(context.Background(), resp)

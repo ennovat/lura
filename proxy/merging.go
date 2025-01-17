@@ -1,59 +1,160 @@
 // SPDX-License-Identifier: Apache-2.0
+
 package proxy
 
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/luraproject/lura/config"
+	"github.com/luraproject/lura/v2/config"
+	"github.com/luraproject/lura/v2/logging"
 )
 
 // NewMergeDataMiddleware creates proxy middleware for merging responses from several backends
-func NewMergeDataMiddleware(endpointConfig *config.EndpointConfig) Middleware {
+func NewMergeDataMiddleware(logger logging.Logger, endpointConfig *config.EndpointConfig) Middleware { // skipcq: GO-R1005
 	totalBackends := len(endpointConfig.Backend)
 	if totalBackends == 0 {
-		panic(ErrNoBackends)
+		logger.Fatal("all endpoints must have at least one backend: NewMergeDataMiddleware")
+		return nil
 	}
 	if totalBackends == 1 {
-		return EmptyMiddleware
+		return emptyMiddlewareFallback(logger)
 	}
 	serviceTimeout := time.Duration(85*endpointConfig.Timeout.Nanoseconds()/100) * time.Nanosecond
 	combiner := getResponseCombiner(endpointConfig.ExtraConfig)
+	isSequential, propagatedParams := sequentialMergerConfig(endpointConfig)
+
+	logger.Debug(
+		fmt.Sprintf(
+			"[ENDPOINT: %s][Merge] Backends: %d, sequential: %t, combiner: %s",
+			endpointConfig.Endpoint,
+			totalBackends,
+			isSequential,
+			getResponseCombinerName(endpointConfig.ExtraConfig),
+		),
+	)
 
 	return func(next ...Proxy) Proxy {
 		if len(next) != totalBackends {
-			panic(ErrNotEnoughProxies)
+			// we leave the panic here, because we do not want to continue
+			// if this configuration is wrong, as it would lead to unexpected
+			// behaviour.
+			logger.Fatal("not enough proxies for this endpoint: NewMergeDataMiddleware")
+			return nil
+		}
+		reqClone := func(r *Request) *Request { res := r.Clone(); return &res }
+
+		if hasUnsafeBackends(endpointConfig) {
+			reqClone = CloneRequest
 		}
 
-		if !shouldRunSequentialMerger(endpointConfig) {
-			return parallelMerge(serviceTimeout, combiner, next...)
+		if !isSequential {
+			return parallelMerge(reqClone, serviceTimeout, combiner, next...)
 		}
 
-		patterns := make([]string, len(endpointConfig.Backend))
+		sequentialReplacements := make([][]sequentialBackendReplacement, totalBackends)
+
+		var rePropagatedParams = regexp.MustCompile(`[Rr]esp(\d+)_?([\w-.]+)?`)
+		var reUrlPatterns = regexp.MustCompile(`\{\{\.Resp(\d+)_([\w-.]+)\}\}`)
+		destKeyGenerator := func(i string, t string) string {
+			key := "Resp" + i
+			if t != "" {
+				key += "_" + t
+			}
+			return key
+		}
+
 		for i, b := range endpointConfig.Backend {
-			patterns[i] = b.URLPattern
+			for _, match := range reUrlPatterns.FindAllStringSubmatch(b.URLPattern, -1) {
+				if len(match) > 1 {
+					backendIndex, err := strconv.Atoi(match[1])
+					if err != nil {
+						continue
+					}
+
+					sequentialReplacements[i] = append(sequentialReplacements[i], sequentialBackendReplacement{
+						backendIndex: backendIndex,
+						destination:  destKeyGenerator(match[1], match[2]),
+						source:       strings.Split(match[2], "."),
+						fullResponse: match[2] == "",
+					})
+				}
+			}
+
+			if i > 0 {
+				for _, p := range propagatedParams {
+					for _, match := range rePropagatedParams.FindAllStringSubmatch(p, -1) {
+						if len(match) > 1 {
+							backendIndex, err := strconv.Atoi(match[1])
+							if err != nil || backendIndex >= totalBackends {
+								continue
+							}
+
+							sequentialReplacements[i] = append(sequentialReplacements[i], sequentialBackendReplacement{
+								backendIndex: backendIndex,
+								destination:  destKeyGenerator(match[1], match[2]),
+								source:       strings.Split(match[2], "."),
+								fullResponse: match[2] == "",
+							})
+						}
+					}
+				}
+			}
 		}
-		return sequentialMerge(patterns, serviceTimeout, combiner, next...)
+
+		return sequentialMerge(reqClone, sequentialReplacements, serviceTimeout, combiner, next...)
 	}
 }
 
-func shouldRunSequentialMerger(endpointConfig *config.EndpointConfig) bool {
-	if v, ok := endpointConfig.ExtraConfig[Namespace]; ok {
+type sequentialBackendReplacement struct {
+	backendIndex int
+	destination  string
+	source       []string
+	fullResponse bool
+}
+
+func sequentialMergerConfig(cfg *config.EndpointConfig) (bool, []string) {
+	enabled := false
+	var propagatedParams []string
+	if v, ok := cfg.ExtraConfig[Namespace]; ok {
 		if e, ok := v.(map[string]interface{}); ok {
 			if v, ok := e[isSequentialKey]; ok {
 				c, ok := v.(bool)
-				return ok && c
+				enabled = ok && c
+			}
+			if v, ok := e[sequentialPropagateKey]; ok {
+				if a, ok := v.([]interface{}); ok {
+					for _, p := range a {
+						propagatedParams = append(propagatedParams, p.(string))
+					}
+				}
 			}
 		}
 	}
+	return enabled, propagatedParams
+}
+
+func hasUnsafeBackends(cfg *config.EndpointConfig) bool {
+	if len(cfg.Backend) == 1 {
+		return false
+	}
+
+	for _, b := range cfg.Backend {
+		if m := strings.ToUpper(b.Method); m != http.MethodGet && m != http.MethodHead {
+			return true
+		}
+	}
+
 	return false
 }
 
-func parallelMerge(timeout time.Duration, rc ResponseCombiner, next ...Proxy) Proxy {
+func parallelMerge(reqCloner func(*Request) *Request, timeout time.Duration, rc ResponseCombiner, next ...Proxy) Proxy {
 	return func(ctx context.Context, request *Request) (*Response, error) {
 		localCtx, cancel := context.WithTimeout(ctx, timeout)
 
@@ -61,7 +162,7 @@ func parallelMerge(timeout time.Duration, rc ResponseCombiner, next ...Proxy) Pr
 		failed := make(chan error, len(next))
 
 		for _, n := range next {
-			go requestPart(localCtx, n, request, false, parts, failed)
+			go requestPart(localCtx, n, reqCloner(request), parts, failed)
 		}
 
 		acc := newIncrementalMergeAccumulator(len(next), rc)
@@ -80,79 +181,97 @@ func parallelMerge(timeout time.Duration, rc ResponseCombiner, next ...Proxy) Pr
 	}
 }
 
-var reMergeKey = regexp.MustCompile(`\{\{\.Resp(\d+)_([\d\w-_\.]+)\}\}`)
-
-func sequentialMerge(patterns []string, timeout time.Duration, rc ResponseCombiner, next ...Proxy) Proxy {
+func sequentialMerge(reqCloner func(*Request) *Request, sequentialReplacements [][]sequentialBackendReplacement, timeout time.Duration, rc ResponseCombiner, next ...Proxy) Proxy { // skipcq: GO-R1005
 	return func(ctx context.Context, request *Request) (*Response, error) {
 		localCtx, cancel := context.WithTimeout(ctx, timeout)
 
 		parts := make([]*Response, len(next))
 		out := make(chan *Response, 1)
 		errCh := make(chan error, 1)
+		sequentialMergeRegistry := map[string]string{}
 
 		acc := newIncrementalMergeAccumulator(len(next), rc)
 	TxLoop:
 		for i, n := range next {
 			if i > 0 {
-				for _, match := range reMergeKey.FindAllStringSubmatch(patterns[i], -1) {
-					if len(match) > 1 {
-						rNum, err := strconv.Atoi(match[1])
-						if err != nil || rNum >= i || parts[rNum] == nil {
-							continue
-						}
-						key := "Resp" + match[1] + "_" + match[2]
+				for _, r := range sequentialReplacements[i] {
+					if r.backendIndex >= i || parts[r.backendIndex] == nil {
+						continue
+					}
 
-						var v interface{}
-						var ok bool
+					var v interface{}
+					var ok bool
 
-						data := parts[rNum].Data
-						keys := strings.Split(match[2], ".")
-						if len(keys) > 1 {
-							for _, k := range keys[:len(keys)-1] {
-								v, ok = data[k]
-								if !ok {
-									break
-								}
-								switch clean := v.(type) {
-								case map[string]interface{}:
-									data = clean
-								default:
-									break
-								}
+					data := parts[r.backendIndex].Data
+					if len(r.source) > 1 {
+						for _, k := range r.source[:len(r.source)-1] {
+							v, ok = data[k]
+							if !ok {
+								break
 							}
-						}
-
-						v, ok = data[keys[len(keys)-1]]
-						if !ok {
-							continue
-						}
-						switch clean := v.(type) {
-						case []interface{}:
-							if len(clean) == 0 {
-								request.Params[key] = ""
-								continue
+							clean, ok := v.(map[string]interface{})
+							if !ok {
+								break
 							}
-							var b strings.Builder
-							for i := 0; i < len(clean)-1; i++ {
-								fmt.Fprintf(&b, "%v,", clean[i])
-							}
-							fmt.Fprintf(&b, "%v", clean[len(clean)-1])
-							request.Params[key] = b.String()
-						case string:
-							request.Params[key] = clean
-						case int:
-							request.Params[key] = strconv.Itoa(clean)
-						case float64:
-							request.Params[key] = strconv.FormatFloat(clean, 'E', -1, 32)
-						case bool:
-							request.Params[key] = strconv.FormatBool(clean)
-						default:
-							request.Params[key] = fmt.Sprintf("%v", v)
+							data = clean
 						}
 					}
+
+					if found := sequentialMergeRegistry[r.destination]; found != "" {
+						request.Params[r.destination] = found
+						continue
+					}
+
+					if r.fullResponse {
+						if parts[r.backendIndex].Io == nil {
+							continue
+						}
+						buf, err := io.ReadAll(parts[r.backendIndex].Io)
+
+						if err == nil {
+							request.Params[r.destination] = string(buf)
+							sequentialMergeRegistry[r.destination] = string(buf)
+						}
+						continue
+					}
+
+					v, ok = data[r.source[len(r.source)-1]]
+					if !ok {
+						continue
+					}
+
+					var param string
+
+					switch clean := v.(type) {
+					case []interface{}:
+						if len(clean) == 0 {
+							request.Params[r.destination] = ""
+							break
+						}
+						var b strings.Builder
+						for i := 0; i < len(clean)-1; i++ {
+							fmt.Fprintf(&b, "%v,", clean[i])
+						}
+						fmt.Fprintf(&b, "%v", clean[len(clean)-1])
+						param = b.String()
+					case string:
+						param = clean
+					case int:
+						param = strconv.Itoa(clean)
+					case float64:
+						param = strconv.FormatFloat(clean, 'E', -1, 32)
+					case bool:
+						param = strconv.FormatBool(clean)
+					default:
+						param = fmt.Sprintf("%v", v)
+					}
+					request.Params[r.destination] = param
+					sequentialMergeRegistry[r.destination] = param
 				}
 			}
-			requestPart(localCtx, n, request, true, out, errCh)
+
+			sequentialRequestPart(localCtx, n, reqCloner(request), out, errCh)
+
 			select {
 			case err := <-errCh:
 				if i == 0 {
@@ -213,7 +332,7 @@ func (i *incrementalMergeAccumulator) Merge(res *Response, err error) {
 
 func (i *incrementalMergeAccumulator) Result() (*Response, error) {
 	if i.data == nil {
-		return &Response{Data: make(map[string]interface{}, 0), IsComplete: false}, newMergeError(i.errs)
+		return nil, newMergeError(i.errs)
 	}
 
 	if i.pending != 0 || len(i.errs) != 0 {
@@ -222,20 +341,10 @@ func (i *incrementalMergeAccumulator) Result() (*Response, error) {
 	return i.data, newMergeError(i.errs)
 }
 
-func requestPart(ctx context.Context, next Proxy, request *Request, sequential bool, out chan<- *Response, failed chan<- error) {
+func requestPart(ctx context.Context, next Proxy, request *Request, out chan<- *Response, failed chan<- error) {
 	localCtx, cancel := context.WithCancel(ctx)
 
-	var copyRequest *Request
-	if sequential {
-		copyRequest = CloneRequest(request)
-	}
-
 	in, err := next(localCtx, request)
-
-	if sequential {
-		*request = *copyRequest
-	}
-
 	if err != nil {
 		failed <- err
 		cancel()
@@ -252,6 +361,28 @@ func requestPart(ctx context.Context, next Proxy, request *Request, sequential b
 		failed <- ctx.Err()
 	}
 	cancel()
+}
+
+func sequentialRequestPart(ctx context.Context, next Proxy, request *Request, out chan<- *Response, failed chan<- error) {
+	copyRequest := CloneRequest(request)
+
+	in, err := next(ctx, request)
+
+	*request = *copyRequest
+
+	if err != nil {
+		failed <- err
+		return
+	}
+	if in == nil {
+		failed <- errNullResult
+		return
+	}
+	select {
+	case out <- in:
+	case <-ctx.Done():
+		failed <- ctx.Err()
+	}
 }
 
 func newMergeError(errs []error) error {
@@ -273,6 +404,10 @@ func (m mergeError) Error() string {
 	return strings.Join(msg, "\n")
 }
 
+func (m mergeError) Errors() []error {
+	return m.errs
+}
+
 // ResponseCombiner func to merge the collected responses into a single one
 type ResponseCombiner func(int, []*Response) *Response
 
@@ -282,9 +417,10 @@ func RegisterResponseCombiner(name string, f ResponseCombiner) {
 }
 
 const (
-	mergeKey            = "combiner"
-	isSequentialKey     = "sequential"
-	defaultCombinerName = "default"
+	mergeKey               = "combiner"
+	isSequentialKey        = "sequential"
+	sequentialPropagateKey = "sequential_propagated_params"
+	defaultCombinerName    = "default"
 )
 
 var responseCombiners = initResponseCombiners()
@@ -293,18 +429,23 @@ func initResponseCombiners() *combinerRegister {
 	return newCombinerRegister(map[string]ResponseCombiner{defaultCombinerName: combineData}, combineData)
 }
 
-func getResponseCombiner(extra config.ExtraConfig) ResponseCombiner {
-	combiner, _ := responseCombiners.GetResponseCombiner(defaultCombinerName)
+func getResponseCombinerName(extra config.ExtraConfig) string {
 	if v, ok := extra[Namespace]; ok {
 		if e, ok := v.(map[string]interface{}); ok {
 			if v, ok := e[mergeKey]; ok {
-				if c, ok := responseCombiners.GetResponseCombiner(v.(string)); ok {
-					combiner = c
+				if _, ok := responseCombiners.GetResponseCombiner(v.(string)); ok {
+					return v.(string)
 				}
 			}
 		}
 	}
-	return combiner
+	return defaultCombinerName
+}
+
+func getResponseCombiner(extra config.ExtraConfig) ResponseCombiner {
+	combiner := getResponseCombinerName(extra)
+	c, _ := responseCombiners.GetResponseCombiner(combiner)
+	return c
 }
 
 func combineData(total int, parts []*Response) *Response {
@@ -317,7 +458,7 @@ func combineData(total int, parts []*Response) *Response {
 		}
 		isComplete = isComplete && part.IsComplete
 		if retResponse == nil {
-			retResponse = part
+			retResponse = &Response{Data: part.Data, IsComplete: isComplete}
 			continue
 		}
 		for k, v := range part.Data {
@@ -327,7 +468,7 @@ func combineData(total int, parts []*Response) *Response {
 
 	if nil == retResponse {
 		// do not allow nil data in the response:
-		return &Response{Data: make(map[string]interface{}, 0), IsComplete: isComplete}
+		return &Response{Data: make(map[string]interface{}), IsComplete: isComplete}
 	}
 	retResponse.IsComplete = isComplete
 	return retResponse
